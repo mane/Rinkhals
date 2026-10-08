@@ -23,6 +23,8 @@ env:
 jobs:
   build:
     runs-on: ubuntu-latest
+    outputs:
+      pages_enabled: ${{ steps.pages.outputs.enabled }}
     steps:
       - uses: actions/checkout@v6
       - uses: actions/setup-python@v6
@@ -34,13 +36,45 @@ jobs:
       - name: ProperDocs Build
         working-directory: ./docs
         run: properdocs build
+      - name: Check whether GitHub Pages is configured
+        id: pages
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: |
+          python - <<'PY'
+          import os
+          import urllib.error
+          import urllib.request
+
+          request = urllib.request.Request(
+              f"{os.environ['GITHUB_API_URL']}/repos/{os.environ['GITHUB_REPOSITORY']}/pages",
+              headers={
+                  "Accept": "application/vnd.github+json",
+                  "Authorization": f"Bearer {os.environ['GITHUB_TOKEN']}",
+                  "X-GitHub-Api-Version": "2022-11-28",
+              },
+          )
+          try:
+              with urllib.request.urlopen(request, timeout=30):
+                  enabled = "true"
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise SystemExit(f"GitHub Pages configuration check failed: HTTP {error.code}") from None
+              enabled = "false"
+              print("::notice::GitHub Pages is not configured; documentation was built, but deployment is skipped.")
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as output:
+              output.write(f"enabled={enabled}\n")
+          PY
       - name: Upload static files
+        if: steps.pages.outputs.enabled == 'true'
         id: deployment
         uses: actions/upload-pages-artifact@v5 # or specific "vX.X.X" version tag for this action
         with:
           path: ./docs/site
 
   deploy:
+    if: needs.build.outputs.pages_enabled == 'true'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

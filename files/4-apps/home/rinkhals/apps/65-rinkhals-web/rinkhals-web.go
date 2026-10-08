@@ -23,16 +23,16 @@ import (
 )
 
 var processCommands = map[string]string{
-	"gklib":            "gklib",
-	"gkapi":            "gkapi",
-	"K3SysUi":          "K3SysUi",
-	"Moonraker":        "moonraker.py",
-	"Rinkhals UI":      "rinkhals-ui.py",
-	"mjpg-streamer":    "mjpg_streamer",
-	"Rinkhals web": "rinkhals-web",
-	"lighttp":          "lighttpd",
-	"OctoApp":          "octoapp",
-	"OctoEverywhere":   "octoeverywhere",
+	"gklib":          "gklib",
+	"gkapi":          "gkapi",
+	"K3SysUi":        "K3SysUi",
+	"Moonraker":      "moonraker.py",
+	"Rinkhals UI":    "rinkhals-ui.py",
+	"mjpg-streamer":  "mjpg_streamer",
+	"Rinkhals web":   "rinkhals-web",
+	"lighttp":        "lighttpd",
+	"OctoApp":        "octoapp",
+	"OctoEverywhere": "octoeverywhere",
 }
 var processCache = map[string]*process.Process{}
 
@@ -170,29 +170,8 @@ func main() {
 
 	opts.OnConnectionLost = func(client mqtt.Client, err error) {
 		log.Printf("Connection lost: %v", err)
-		for {
-			if token := client.Connect(); token.Wait() && token.Error() == nil {
-				log.Println("Reconnected successfully")
-				break
-			} else {
-				log.Printf("Reconnection failed: %v", token.Error())
-			}
-			time.Sleep(1 * time.Second)
-		}
 	}
-
-	mqttClient := mqtt.NewClient(opts)
-	go func() {
-		for {
-			if token := mqttClient.Connect(); token.Wait() && token.Error() != nil {
-				log.Printf("MQTT connect error: %v, retrying...", token.Error())
-				time.Sleep(5 * time.Second)
-			} else {
-				log.Println("MQTT connected successfully")
-				break
-			}
-		}
-	}()
+	opts.SetAutoReconnect(true)
 
 	// Retrieve current device ID
 	deviceID := ""
@@ -297,10 +276,18 @@ func main() {
 	discoveryPayload = strings.Replace(discoveryPayload, "[[processes]]", "", 1)
 
 	homeAssistantDiscoveryTopic := fmt.Sprintf("homeassistant/device/%s/config", deviceID)
-	token := mqttClient.Publish(homeAssistantDiscoveryTopic, 0, true, discoveryPayload)
-	token.Wait()
-
-	log.Printf("Published Home Assistant discovery topic for device %s", deviceID)
+	opts.OnConnect = discoveryPublisher(homeAssistantDiscoveryTopic, discoveryPayload, deviceID)
+	mqttClient := mqtt.NewClient(opts)
+	go func() {
+		for {
+			token := mqttClient.Connect()
+			if token.Wait() && token.Error() == nil {
+				break
+			}
+			log.Printf("MQTT connect error: %v, retrying...", token.Error())
+			time.Sleep(5 * time.Second)
+		}
+	}()
 
 	// Loop to get monitoring info and send to MQTT broker
 	ticker := time.NewTicker(30 * time.Second)
@@ -387,5 +374,22 @@ func main() {
 
 	for range ticker.C {
 		updateInformation()
+	}
+}
+
+// Called after each successful connection, including reconnects, so initial
+// broker startup delays and lost retained state cannot skip discovery forever.
+func discoveryPublisher(topic, payload, deviceID string) mqtt.OnConnectHandler {
+	return func(client mqtt.Client) {
+		token := client.Publish(topic, 1, true, payload)
+		if !token.WaitTimeout(10 * time.Second) {
+			log.Printf("Home Assistant discovery publish timed out for device %s", deviceID)
+			return
+		}
+		if err := token.Error(); err != nil {
+			log.Printf("Home Assistant discovery publish failed for device %s: %v", deviceID, err)
+			return
+		}
+		log.Printf("Published Home Assistant discovery topic for device %s", deviceID)
 	}
 }

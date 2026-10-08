@@ -19,19 +19,19 @@ import (
 // for individual app.json files - the raw host isn't rate-limited, which keeps us well
 // under the 60 unauthenticated API requests/hour ceiling.
 const (
-	catalogOwner          = "rinkhals-community"
-	catalogRepo           = "Rinkhals.Apps"
-	catalogBranch         = "master"
-	catalogContentsAPI    = "https://api.github.com/repos/rinkhals-community/Rinkhals.Apps/contents/apps"
-	catalogLatestRelease  = "https://api.github.com/repos/rinkhals-community/Rinkhals.Apps/releases/latest"
-	catalogRawBase        = "https://raw.githubusercontent.com/rinkhals-community/Rinkhals.Apps"
-	catalogCacheTTL       = 10 * time.Minute
-	catalogHTTPTimeout    = 15 * time.Second
+	catalogOwner         = "rinkhals-community"
+	catalogRepo          = "Rinkhals.Apps"
+	catalogBranch        = "master"
+	catalogContentsAPI   = "https://api.github.com/repos/rinkhals-community/Rinkhals.Apps/contents/apps"
+	catalogLatestRelease = "https://api.github.com/repos/rinkhals-community/Rinkhals.Apps/releases/latest"
+	catalogRawBase       = "https://raw.githubusercontent.com/rinkhals-community/Rinkhals.Apps"
+	catalogCacheTTL      = 10 * time.Minute
+	catalogHTTPTimeout   = 15 * time.Second
 	// Download to persistent eMMC, not /tmp: /tmp is tmpfs (RAM) and a large app
 	// SWU would be held in memory while install_swu also extracts into /useremain,
 	// risking OOM on memory-constrained printers.
-	catalogDownloadTmp    = "/useremain/rinkhals-catalog"
-	catalogUserAgent      = "rinkhals-web"
+	catalogDownloadTmp = "/useremain/rinkhals-catalog"
+	catalogUserAgent   = "rinkhals-web"
 )
 
 // UpstreamRef mirrors the optional "upstream" block in app.json. Apps that
@@ -69,26 +69,23 @@ type CatalogApp struct {
 }
 
 type Catalog struct {
-	Release   string       `json:"release"`
-	FetchedAt time.Time    `json:"fetched_at"`
-	Model     string       `json:"model"`         // resolved KOBRA_MODEL_CODE
-	AssetGroup string      `json:"asset_group"`   // mapped SWU suffix (e.g. "k2p-k3")
-	Apps      []CatalogApp `json:"apps"`
-	Notice    string       `json:"notice,omitempty"` // surfaced when model has no SWU group mapping
+	Release    string       `json:"release"`
+	FetchedAt  time.Time    `json:"fetched_at"`
+	Model      string       `json:"model"`       // resolved KOBRA_MODEL_CODE
+	AssetGroup string       `json:"asset_group"` // mapped SWU suffix (e.g. "k2p-k3")
+	Apps       []CatalogApp `json:"apps"`
+	Notice     string       `json:"notice,omitempty"` // surfaced when model has no SWU group mapping
 }
 
 // Cache state. catalogDataMu guards the cached pointer and is only ever held
 // briefly; catalogBuildMu serializes the slow network rebuild so concurrent
 // callers don't stampede GitHub. Reads of a fresh cache never block on a
-// rebuild in progress. installMu serializes SWU installs, which share the
-// fixed /useremain/update_swu staging directory inside install_swu.
+// rebuild in progress. The shared install-stage lock protects SWU installs.
 var (
 	catalogDataMu  sync.Mutex
 	catalogBuildMu sync.Mutex
 	catalogData    *Catalog
 	catalogStamp   time.Time
-
-	installMu sync.Mutex
 
 	// Upstream-version lookups have a separate (longer) cache than the
 	// catalog itself. The catalog refreshes every 10 minutes, but upstream
@@ -328,8 +325,8 @@ func rebuildCatalog() (*Catalog, error) {
 		if err != nil {
 			// One bad manifest shouldn't take down the catalog; surface a stub.
 			apps = append(apps, CatalogApp{
-				ID:   e.Name,
-				Name: e.Name,
+				ID:          e.Name,
+				Name:        e.Name,
 				Description: fmt.Sprintf("Failed to read manifest: %v", err),
 			})
 			continue
@@ -488,11 +485,12 @@ func handleCatalogInstall(w http.ResponseWriter, r *http.Request) {
 	// Serialize installs: install_swu wipes and reuses a fixed staging dir
 	// (/useremain/update_swu), so two concurrent installs would corrupt each
 	// other. Reject rather than queue so the caller gets immediate feedback.
-	if !installMu.TryLock() {
-		http.Error(w, "Another install is already in progress", http.StatusConflict)
+	stage, err := acquireInstallStage()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
 		return
 	}
-	defer installMu.Unlock()
+	defer stage.release()
 
 	// Find the catalog entry to discover the download URL for this model.
 	c, err := getCatalog(false)
@@ -531,7 +529,9 @@ func handleCatalogInstall(w http.ResponseWriter, r *http.Request) {
 	// Pipe through install_swu (in tools.sh). This is the same call path the
 	// USB-stick installer uses, so success here matches what users get today.
 	cmd := fmt.Sprintf(". %s\ninstall_swu %s\n", toolsSh, shellQuote(swuPath))
-	out, err := exec.Command("sh", "-c", cmd).CombinedOutput()
+	installCmd := exec.Command("sh", "-c", cmd)
+	installCmd.Env = stage.environment()
+	out, err := installCmd.CombinedOutput()
 	installed := err == nil
 
 	resp := map[string]interface{}{

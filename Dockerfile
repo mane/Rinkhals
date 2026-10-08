@@ -118,6 +118,12 @@ WORKDIR /app
 RUN GOOS=linux GOARCH=arm go build -ldflags="-s -w" -trimpath -v -o rinkhals-web
 
 ###############################################################
+# web-export shares the compiled portal with the just build pipeline
+FROM scratch AS web-export
+COPY --from=build-web-ui /web-portal/build/ /ui/
+COPY --from=build-web-backend /app/rinkhals-web /rinkhals-web
+
+###############################################################
 # app-mainsail prepares Mainsail app files
 FROM build-base AS app-mainsail
 COPY ./build/4-apps/25-mainsail/* /build/

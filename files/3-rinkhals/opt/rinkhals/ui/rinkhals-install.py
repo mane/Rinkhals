@@ -525,17 +525,16 @@ class RinkhalsInstallApp(BaseApp):
             fix_text = 'Patch Kobra startup to install Rinkhals launcher.'
             fix_action = 'Patch'
             def fix_cb(e):
-                if os.path.exists('/useremain/rinkhals/.version'):
-                    if os.path.exists('/userdata/app/gk/start.sh'):
-                        with open('/userdata/app/gk/start.sh', 'r') as f:
-                            script_content = f.read()
-                            if 'Rinkhals/begin' not in script_content:
-                                system(f'cat {SCRIPT_PATH}/start.sh.patch >> /userdata/app/gk/start.sh')
-                    if os.path.exists('/userdata/app/gk/restart_k3c.sh'):
-                        system(f'cat {SCRIPT_PATH}/start.sh.patch >> /userdata/app/gk/restart_k3c.sh')
+                try:
+                    with UpdateLock():
+                        if os.path.exists('/useremain/rinkhals/.version'):
+                            ensure_startup_hooks()
+                except Exception as e:
+                    self.show_text_dialog(str(e))
+                    return
                 self.hide_modal()
-                self.layout_main(force=True)
-                self.layout_diagnostics()
+                self.show_main(force=True)
+                self.show_diagnostics()
         elif diagnostic.fix_action == DiagnosticFixes.REINSTALL_FIRMWARE:
             fix_text = 'Reinstall system firmware. Rinkhals will be re-enabled. Your customizations will be kept.'
             fix_action = 'Reinstall'
@@ -548,7 +547,7 @@ class RinkhalsInstallApp(BaseApp):
             def fix_cb(e):
                 diagnostic.fix_action()
                 self.hide_modal()
-                self.layout_main(True)
+                self.show_main(force=True)
 
         self.modal_diagnostic.label_fix.set_text('Fix: ' + fix_text)
 

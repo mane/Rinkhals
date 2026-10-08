@@ -17,7 +17,7 @@
     let modalInput = $state('');
     let modalActionLoading = $state(false);
 
-    const apiHost = import.meta.env.DEV ? 'http://localhost:8090' : '';
+    const apiHost = '';
 
     async function loadFiles(path: string) {
         loading = true;

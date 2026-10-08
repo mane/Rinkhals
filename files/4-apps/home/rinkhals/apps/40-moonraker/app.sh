@@ -1,20 +1,21 @@
 . /useremain/rinkhals/.current/tools.sh
 
-APP_ROOT=$(dirname $(realpath $0))
+APP_ROOT=$(dirname "$(realpath "$0")")
+. "$APP_ROOT/moonraker-lifecycle.sh"
 
 status() {
-    PIDS=$(get_by_name moonraker.py)
+    PIDS=$(moonraker_find_processes worker | awk '{print $1}')
 
-    if [ "$PIDS" == "" ]; then
+    if [ -z "$PIDS" ]; then
         report_status $APP_STATUS_STOPPED
     else
         report_status $APP_STATUS_STARTED "$PIDS"
     fi
 }
 start() {
-    stop
+    stop || return 1
 
-    cd $APP_ROOT
+    cd "$APP_ROOT" || return 1
 
     chmod +x moonraker.sh
     # Detach stdin/stdout/stderr from /dev/null. moonraker.sh stays resident
@@ -23,12 +24,12 @@ start() {
     # menu (rinkhals-ui.py), which captures the command's output through a
     # pipe, that keeps the pipe's write end open and hangs the UI (a frozen
     # touchscreen). moonraker.sh writes everything to app-moonraker.log.
-    ./moonraker.sh </dev/null >/dev/null 2>&1 &
+    sh "$APP_ROOT/moonraker.sh" </dev/null >/dev/null 2>&1 &
 }
 debug() {
-    stop
+    stop || return 1
 
-    cd $APP_ROOT
+    cd "$APP_ROOT" || return 1
     
     python -m venv --without-pip .
     . bin/activate
@@ -39,10 +40,20 @@ debug() {
     python /opt/rinkhals/scripts/process-cfg.py moonraker.conf > /userdata/app/gk/printer_data/config/moonraker.generated.conf
     mkdir -p /userdata/app/gk/printer_data/logs
     chmod 777 /userdata/app/gk/printer_data/logs
-    TMPDIR=/useremain/tmp HOME=/userdata/app/gk python ./moonraker/moonraker/moonraker.py -c /userdata/app/gk/printer_data/config/moonraker.generated.conf $@
+    TMPDIR=/useremain/tmp HOME=/userdata/app/gk python "$APP_ROOT/moonraker/moonraker/moonraker.py" -c /userdata/app/gk/printer_data/config/moonraker.generated.conf $@
 }
 stop() {
-    kill_by_name moonraker.py
+    # Stop the restart loop first, otherwise killing Python looks like a crash
+    # and the old supervisor starts another instance after the next start.
+    moonraker_find_processes supervisor | while read -r pid identity; do
+        moonraker_terminate "$pid" "$identity" 15 || exit 1
+    done || return 1
+
+    # Cover old/debug launches without a supervisor and any orphaned child.
+    moonraker_find_processes worker | while read -r pid identity; do
+        moonraker_terminate "$pid" "$identity" 10 || exit 1
+    done || return 1
+    rm -f "$MOONRAKER_PIDFILE"
 }
 
 case "$1" in
@@ -57,7 +68,7 @@ case "$1" in
         debug $@
         ;;
     stop)
-        stop
+        stop || exit 1
         ;;
     *)
         echo "Usage: $0 {status|start|debug|stop}" >&2

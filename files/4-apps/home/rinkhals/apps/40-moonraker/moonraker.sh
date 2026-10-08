@@ -1,5 +1,38 @@
 . /useremain/rinkhals/.current/tools.sh
 
+APP_ROOT=$(dirname "$(realpath "$0")")
+. "$APP_ROOT/moonraker-lifecycle.sh"
+cd "$APP_ROOT" || exit 1
+
+MOONRAKER_PID=""
+MOONRAKER_IDENTITY=""
+RESTART_SLEEP_PID=""
+RESTART_SLEEP_IDENTITY=""
+STOP_REQUESTED=0
+SUPERVISOR_IDENTITY=$(moonraker_process_identity "$$") || exit 1
+
+cleanup() {
+    trap '' TERM INT
+    if [ -n "$MOONRAKER_PID" ]; then
+        moonraker_terminate "$MOONRAKER_PID" "$MOONRAKER_IDENTITY" 10
+        wait "$MOONRAKER_PID" 2>/dev/null
+    fi
+    if [ -n "$RESTART_SLEEP_PID" ]; then
+        moonraker_terminate "$RESTART_SLEEP_PID" "$RESTART_SLEEP_IDENTITY" 1
+        wait "$RESTART_SLEEP_PID" 2>/dev/null
+    fi
+    if [ "$(cat "$MOONRAKER_PIDFILE" 2>/dev/null)" = "$$ $SUPERVISOR_IDENTITY" ]; then
+        rm -f "$MOONRAKER_PIDFILE"
+    fi
+}
+
+# Install traps before setup. The flag also covers TERM between spawning a
+# child and recording $!, so cleanup cannot leave that child behind.
+trap 'STOP_REQUESTED=1' TERM INT
+trap cleanup EXIT
+mkdir -p "$(dirname "$MOONRAKER_PIDFILE")"
+printf '%s %s\n' "$$" "$SUPERVISOR_IDENTITY" > "$MOONRAKER_PIDFILE"
+
 # Activate Python venv
 python -m venv --without-pip .
 . bin/activate
@@ -23,37 +56,6 @@ python /opt/rinkhals/scripts/process-cfg.py moonraker.conf > /userdata/app/gk/pr
 sysctl -w kernel.msgmax=65536 >/dev/null 2>&1
 sysctl -w kernel.msgmnb=65536 >/dev/null 2>&1
 
-# Graceful shutdown handler
-# Ensures Moonraker stops gracefully on SIGTERM/SIGINT
-MOONRAKER_PID=""
-cleanup() {
-    echo "$(date): Received shutdown signal, stopping Moonraker gracefully" >> $RINKHALS_ROOT/logs/app-moonraker.log
-
-    if [ ! -z "$MOONRAKER_PID" ]; then
-        # Send SIGTERM to allow graceful cleanup
-        kill -TERM $MOONRAKER_PID 2>/dev/null
-
-        # Wait up to 10 seconds for graceful shutdown
-        for i in {1..10}; do
-            if ! kill -0 $MOONRAKER_PID 2>/dev/null; then
-                echo "$(date): Moonraker stopped gracefully" >> $RINKHALS_ROOT/logs/app-moonraker.log
-                break
-            fi
-            sleep 1
-        done
-
-        # Force kill if still running
-        if kill -0 $MOONRAKER_PID 2>/dev/null; then
-            echo "$(date): Force killing Moonraker" >> $RINKHALS_ROOT/logs/app-moonraker.log
-            kill -KILL $MOONRAKER_PID 2>/dev/null
-        fi
-    fi
-
-    exit 0
-}
-
-trap cleanup SIGTERM SIGINT
-
 # Auto-restart mechanism with memory limit
 # Protects against memory leaks causing system crashes
 start_moonraker_with_restart() {
@@ -61,7 +63,7 @@ start_moonraker_with_restart() {
     local max_crashes=5
     local crash_window_start=$(date +%s)
 
-    while true; do
+    while [ "$STOP_REQUESTED" -eq 0 ]; do
         # Reset crash counter if more than 5 minutes have passed
         local current_time=$(date +%s)
         if [ $((current_time - crash_window_start)) -gt 300 ]; then
@@ -83,13 +85,18 @@ start_moonraker_with_restart() {
         mkdir -p /useremain/tmp
         mkdir -p /userdata/app/gk/printer_data/logs
         chmod 777 /userdata/app/gk/printer_data/logs
-        TMPDIR=/useremain/tmp HOME=/userdata/app/gk python ./moonraker/moonraker/moonraker.py \
+        TMPDIR=/useremain/tmp HOME=/userdata/app/gk python "$APP_ROOT/moonraker/moonraker/moonraker.py" \
             -c /userdata/app/gk/printer_data/config/moonraker.generated.conf \
             >> $RINKHALS_ROOT/logs/app-moonraker.log 2>&1 &
 
         MOONRAKER_PID=$!
-        wait $MOONRAKER_PID
+        MOONRAKER_IDENTITY=$(moonraker_process_identity "$MOONRAKER_PID")
+        [ "$STOP_REQUESTED" -eq 0 ] || return 0
+        wait "$MOONRAKER_PID"
         exit_code=$?
+        [ "$STOP_REQUESTED" -eq 0 ] || return 0
+        MOONRAKER_PID=""
+        MOONRAKER_IDENTITY=""
 
         echo "$(date): Moonraker exited with code $exit_code" >> $RINKHALS_ROOT/logs/app-moonraker.log
 
@@ -111,7 +118,14 @@ start_moonraker_with_restart() {
 
         # Wait before restart
         echo "$(date): Waiting 10 seconds before restart..." >> $RINKHALS_ROOT/logs/app-moonraker.log
-        sleep 10
+        sleep 10 &
+        RESTART_SLEEP_PID=$!
+        RESTART_SLEEP_IDENTITY=$(moonraker_process_identity "$RESTART_SLEEP_PID")
+        [ "$STOP_REQUESTED" -eq 0 ] || return 0
+        wait "$RESTART_SLEEP_PID"
+        [ "$STOP_REQUESTED" -eq 0 ] || return 0
+        RESTART_SLEEP_PID=""
+        RESTART_SLEEP_IDENTITY=""
     done
 }
 

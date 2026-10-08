@@ -3,21 +3,31 @@
     import { firmwareStatus } from "$lib/firmwareStatus";
     import PatchesCard from "$lib/PatchesCard.svelte";
 
+    type ManagementTool = {
+        id: string;
+        name: string;
+        description: string;
+        icon: any;
+        danger: boolean;
+        action?: () => Promise<void>;
+    };
+
     let loadingAction = $state<string | null>(null);
     let logs = $state<string>('');
     let showConfirmDialog = $state<boolean>(false);
-    let actionToConfirm = $state<{id: string, name: string, description: string, icon: any} | null>(null);
+    let actionToConfirm = $state<ManagementTool | null>(null);
 
     let isChangingPassword = $state(false);
     let authSaving = $state(false);
     let p_username = $state('admin');
+    let p_currentUsername = $state('admin');
     let p_current = $state('');
     let p_new = $state('');
     let p_confirm = $state('');
     let p_error = $state('');
     let p_success = $state('');
 
-    const tools = [
+    const tools: ManagementTool[] = [
         {
             id: 'debug-bundle',
             name: 'Generate debug bundle',
@@ -73,7 +83,7 @@
         }
     }
 
-    function confirmAction(tool: any) {
+    function confirmAction(tool: ManagementTool) {
         if (tool.danger) {
             actionToConfirm = tool;
             showConfirmDialog = true;
@@ -115,8 +125,8 @@
         }
         authSaving = true;
         try {
-            const creds = btoa(`${p_username}:${p_current}`);
-            const host = import.meta.env.DEV ? "http://localhost:8090" : "";
+            const creds = btoa(`${p_currentUsername}:${p_current}`);
+            const host = "";
             const testRes = await fetch(`${host}/api/auth/status`, {
                 headers: { 'Authorization': `Basic ${creds}` }
             });
@@ -335,7 +345,11 @@
 
             <form onsubmit={(e) => { e.preventDefault(); changePassword(); }} class="space-y-4">
                 <div>
-                    <label class="block text-xs font-medium text-ink-muted mb-1" for="p_user">Username</label>
+                    <label class="block text-xs font-medium text-ink-muted mb-1" for="p_current_user">Current username</label>
+                    <input id="p_current_user" type="text" bind:value={p_currentUsername} autocomplete="username" class="w-full bg-canvas border border-line rounded-lg px-3 py-2 text-ink focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand" required />
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-ink-muted mb-1" for="p_user">New username</label>
                     <input id="p_user" type="text" bind:value={p_username} class="w-full bg-canvas border border-line rounded-lg px-3 py-2 text-ink focus:outline-none focus:ring-2 focus:ring-brand/30 focus:border-brand" required />
                 </div>
                 <div>

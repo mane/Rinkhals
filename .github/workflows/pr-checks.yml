@@ -40,6 +40,14 @@ jobs:
         working-directory: web-portal
         run: npm run build
 
+      - name: Install browser for integration tests
+        working-directory: web-portal
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser integration tests
+        working-directory: web-portal
+        run: npm run test:browser
+
       - name: Prepare embedded UI for Go
         run: |
           mkdir -p files/4-apps/home/rinkhals/apps/65-rinkhals-web/ui
@@ -50,11 +58,61 @@ jobs:
           go-version-file: files/4-apps/home/rinkhals/apps/65-rinkhals-web/go.mod
           cache-dependency-path: files/4-apps/home/rinkhals/apps/65-rinkhals-web/go.sum
 
-      - name: Go race tests and vet
+      - name: Start isolated MQTT broker
+        run: |
+          docker run --detach --name rinkhals-mqtt-test \
+            --publish 127.0.0.1:18883:1883 \
+            --mount type=bind,source="$GITHUB_WORKSPACE/tests/integration/mosquitto.conf",target=/mosquitto/config/mosquitto.conf,readonly \
+            eclipse-mosquitto:2
+          python3 - <<'PY'
+          import socket, time
+          for attempt in range(40):
+              try:
+                  with socket.create_connection(('127.0.0.1', 18883), timeout=1):
+                      break
+              except OSError:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit('Integration broker did not start')
+          PY
+
+      - name: Go race tests, MQTT integration and vet
         working-directory: files/4-apps/home/rinkhals/apps/65-rinkhals-web
+        env:
+          RINKHALS_TEST_MQTT_BROKER: tcp://127.0.0.1:18883
         run: |
           go test -race ./...
           go vet ./...
+
+      - name: Cross-compile static ARMv7 backend
+        working-directory: files/4-apps/home/rinkhals/apps/65-rinkhals-web
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm
+          GOARM: '7'
+        run: |
+          go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/rinkhals-web-armv7" .
+          readelf -h "$RUNNER_TEMP/rinkhals-web-armv7" | grep -E 'Machine:.*ARM'
+          if readelf -l "$RUNNER_TEMP/rinkhals-web-armv7" | grep -q INTERP; then
+            echo "Backend must not depend on a dynamic loader"
+            exit 1
+          fi
+
+      - name: Stop integration broker
+        if: always()
+        run: docker rm -f rinkhals-mqtt-test || true
+
+      - name: Upload browser failure report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-failure-report
+          path: |
+            web-portal/output/playwright
+            web-portal/playwright-report
+            web-portal/test-results
+          if-no-files-found: ignore
 
   python-tests:
     name: Python and shell regression tests
@@ -71,3 +129,11 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+      - name: Moonraker lifecycle on Linux BusyBox
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev \
+            --mount type=bind,source="$GITHUB_WORKSPACE",target=/workspace,readonly \
+            --workdir /workspace --env PYTHONDONTWRITEBYTECODE=1 \
+            python:3.11-alpine \
+            python -m unittest discover -s tests -p test_shell_moonraker.py -v

@@ -115,7 +115,7 @@ WORKDIR /app
 # pressure): measured ~12 MB PSS packed vs ~8 MB unpacked, with pinned anon
 # memory dropping from ~8.3 MB to ~1.4 MB. The ~6 MB of extra on-disk size is
 # negligible on /useremain.
-RUN GOOS=linux GOARCH=arm go build -ldflags="-s -w" -trimpath -v -o rinkhals-web
+RUN CGO_ENABLED=0 GOOS=linux GOARCH=arm GOARM=7 go build -ldflags="-s -w" -trimpath -v -o rinkhals-web
 
 ###############################################################
 # web-export shares the compiled portal with the just build pipeline
@@ -165,6 +165,8 @@ RUN /build/get-novnc.sh
 ###############################################################
 # build-swu-installer builds the Installer tool SWU files
 FROM build-base AS build-swu-installer
+ARG version="dev"
+ENV RINKHALS_VERSION=${version}
 COPY ./build/swu-tools/installer/ /build/swu-tools/installer/
 COPY ./build/*.* /build/
 COPY --from=buildroot-build /files/1-buildroot/ /files/1-buildroot/
@@ -249,11 +251,16 @@ RUN <<EOT
     . /tools.sh
     mkdir -p /swu
     prepare_tgz /bundle /swu
-    compress_swu K3 /swu/update-k2p-k3.swu &
-    compress_swu K3M /swu/update-k3m.swu &
-    compress_swu KS1 /swu/update-ks1.swu &
-    compress_swu KS1M /swu/update-ks1m.swu &
-    wait $(jobs -p)
+    compress_swu K3 /swu/update-k2p-k3.swu & p1=$!
+    compress_swu K3M /swu/update-k3m.swu & p2=$!
+    compress_swu KS1 /swu/update-ks1.swu & p3=$!
+    compress_swu KS1M /swu/update-ks1m.swu & p4=$!
+    # A single `wait` can hide an earlier failed compressor.
+    result=0
+    for pid in "$p1" "$p2" "$p3" "$p4"; do
+        wait "$pid" || result=1
+    done
+    exit "$result"
 EOT
 
 ###############################################################

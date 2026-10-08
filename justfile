@@ -225,12 +225,24 @@ bundle version="dev": \
 # Build all SWU outputs (update, installer, tools)
 [group('assembly')]
 swu-all: swu-update swu-installer swu-tools
+    python3 {{workspace}}/build/verify-swu.py "$SWU_DIR"
     @echo "All SWU files built: $SWU_DIR"
+
+# Validate encrypted archives and required runtime files without executing payloads
+[group('assembly')]
+swu-verify:
+    python3 {{workspace}}/build/verify-swu.py "$SWU_DIR"
 
 # Build installer SWU files for all printer models (requires: buildroot, python-packages)
 [group('assembly'), script]
 swu-installer: (require "buildroot" FILES_DIR / "1-buildroot/bin") (require "python-packages" FILES_DIR / "2-python/usr/lib")
     mkdir -p $SWU_DIR
+    if [ -f "$BUNDLE_DIR/.version" ]; then
+        RINKHALS_VERSION=$(cat "$BUNDLE_DIR/.version")
+    else
+        RINKHALS_VERSION=${RINKHALS_VERSION:-dev}
+    fi
+    export RINKHALS_VERSION
     parallel --halt now,fail=1 --tagstring '[installer-{2}]' \
         'KOBRA_MODEL_CODE={1} {{workspace}}/build/swu-tools/installer/build-swu.sh '$SWU_DIR'/installer-{2}.swu' \
         ::: K3 K3M KS1 KS1M :::+ k2p-k3 k3m ks1 ks1m

@@ -8,6 +8,7 @@ import (
 	"io/fs"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -24,14 +25,26 @@ var uiFiles embed.FS
 var upgrader = websocket.Upgrader{
 	ReadBufferSize:  1024,
 	WriteBufferSize: 1024,
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all origins for MVP
-	},
+	CheckOrigin:     allowedWebSocketOrigin,
+}
+
+func allowedWebSocketOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" || allowedOrigins[origin] {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.User != nil || u.RawQuery != "" || u.Fragment != "" || u.Path != "" {
+		return false
+	}
+	// A reverse proxy may terminate TLS before forwarding HTTP to this server.
+	// Match the public Host without trusting arbitrary forwarded headers.
+	return (u.Scheme == "http" || u.Scheme == "https") && strings.EqualFold(u.Host, r.Host)
 }
 
 type FileInfo struct {
-	Name     string `json:"name"`
-	Path     string `json:"path"`
+	Name string `json:"name"`
+	Path string `json:"path"`
 	// Type is one of "file", "folder", "link". A symlink reports type "link"
 	// regardless of what it points at; the UI decides navigation behaviour
 	// based on TargetType (see below).
@@ -254,7 +267,7 @@ func handleTerminal(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleTools(w http.ResponseWriter, r *http.Request) {
-	if r.Method != "POST" && r.Method != "GET" {
+	if r.Method != http.MethodPost && r.Method != http.MethodGet {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -281,8 +294,21 @@ func handleTools(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid action", http.StatusBadRequest)
 		return
 	}
+	// Only downloads may use GET; maintenance actions must never run from a
+	// cross-site image/link request carrying cached Basic credentials.
+	if r.Method == http.MethodGet && action != "debug-bundle" {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	stage, err := acquireInstallStage()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	defer stage.release()
 
 	cmd := exec.Command("sh", scriptPath)
+	cmd.Env = stage.environment()
 	output, err := cmd.CombinedOutput()
 	if err != nil {
 		log.Printf("Tool %s execution failed: %v, Output: %s", action, err, string(output))
@@ -376,7 +402,7 @@ func getCredentials() (string, string) {
 		os.WriteFile(authFile, []byte(defaultAuth), 0600)
 		return "admin", "rinkhals"
 	}
-	parts := strings.SplitN(strings.TrimSpace(string(data)), ":", 2)
+	parts := strings.SplitN(strings.TrimRight(string(data), "\r\n"), ":", 2)
 	if len(parts) == 2 {
 		return parts[0], parts[1]
 	}
@@ -398,6 +424,10 @@ var allowedOrigins = map[string]bool{
 // have to be answered before auth runs or they would 401.
 func corsMiddleware(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead && r.Method != http.MethodOptions && !allowedWebSocketOrigin(r) {
+			http.Error(w, "Origin not allowed", http.StatusForbidden)
+			return
+		}
 		if origin := r.Header.Get("Origin"); allowedOrigins[origin] {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Set("Access-Control-Allow-Credentials", "true")
@@ -448,6 +478,10 @@ func handleAuthChange(w http.ResponseWriter, r *http.Request) {
 	}
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil || req.Username == "" || req.Password == "" {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
+	if strings.ContainsAny(req.Username, ":\r\n") || strings.ContainsAny(req.Password, "\r\n") {
+		http.Error(w, "Invalid username or password", http.StatusBadRequest)
 		return
 	}
 

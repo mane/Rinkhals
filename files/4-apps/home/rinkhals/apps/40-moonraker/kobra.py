@@ -10,6 +10,7 @@ import subprocess
 import shlex
 import ast
 import random
+from contextvars import ContextVar
 import paho.mqtt.client as paho
 
 from ..utils import Sentinel
@@ -1003,98 +1004,91 @@ class Kobra:
         from .klippy_apis import KlippyAPI
         from .klippy_connection import KlippyConnection
 
-        async def handle_gcode(me, script, delegate_run_gcode: Callable[[], Coroutine]):
-            parts = [s.strip() for s in shlex.split(script.strip()) if s.strip()]
-            logging.debug(f"hook on gcode received: {json.dumps(parts)}")
+        # KlippyAPI.run_gcode delegates through KlippyConnection.request. Only
+        # bypass the second interception while forwarding an already processed
+        # command; commands explicitly issued by a handler still need dispatch.
+        forwarding_gcode = ContextVar("kobra_forwarding_gcode", default=False)
 
-            # Split multi-command lines (e.g., "CMD1 ARG1=X CMD2 ARG2=Y")
-            # Find indices where a part is a registered handler (indicates new command)
-            handler_indices = [0]  # First part is always a command
-            for i, part in enumerate(parts[1:], 1):
-                if part in self.gcode_handlers and '=' not in part:
-                    handler_indices.append(i)
+        async def handle_gcode(script, forward):
+            pending = []
+            last_result = None
 
-            # If multiple commands detected, execute them sequentially
-            if len(handler_indices) > 1:
-                logging.debug(f"Multiple commands detected in one line: {handler_indices}")
-                last_result = None
-                for idx, start_idx in enumerate(handler_indices):
-                    end_idx = handler_indices[idx + 1] if idx + 1 < len(handler_indices) else len(parts)
-                    sub_parts = parts[start_idx:end_idx]
-                    sub_script = ' '.join(sub_parts)
-                    logging.debug(f"Executing sub-command: {sub_script}")
-                    last_result = await handle_gcode(me, sub_script, delegate_run_gcode)
-                return last_result
+            for line in script.splitlines(keepends=True):
+                match = re.match(r'^\s*([A-Za-z_][A-Za-z0-9_]*)(?=\s|;|$)', line)
+                cmd = match.group(1).upper() if match else None
+                if cmd not in self.gcode_handlers:
+                    # Keep ordinary G-code byte-for-byte, including comments,
+                    # quoting and line endings. It does not need shell parsing.
+                    pending.append(line)
+                    continue
 
-            cmd = parts[0]
+                if pending:
+                    last_result = await forward(''.join(pending))
+                    pending.clear()
 
-            logging.debug(f"hook on gcode cmd: {cmd}")
-            handlers = self.gcode_handlers.keys()
-            # join handlers
-            handlers = ', '.join(handlers)
-            logging.debug(f"hook on gcode handlers: {handlers}")
+                command_line = self._normalize_exclude_object_script(line)
+                command_line = self._normalize_print_file_script(command_line)
+                lexer = shlex.shlex(command_line, posix=True)
+                lexer.whitespace_split = True
+                lexer.commenters = ';'
+                try:
+                    parts = list(lexer)
+                except ValueError as exc:
+                    raise self.server.error(f'Invalid arguments for {cmd}: {exc}')
 
-            if cmd in self.gcode_handlers:
-                logging.debug(f"hook on gcode cmd found: {cmd}")
                 args = {}
                 for part in parts[1:]:
-                    if '=' in part:
-                        key, value = part.split('=', 1)
-                        args[key] = value
-                    else:
-                        args[part] = None
+                    key, separator, value = part.partition('=')
+                    args[key.upper()] = value if separator else None
 
-                logging.debug(f"hook on gcode args: {json.dumps(args)}")
-                result = await self.gcode_handlers[cmd](args, delegate_run_gcode)
-                result_str = "None" if result is None else "Any"
-                logging.debug(f"hook on gcode result: {result_str}")
+                # Bind the exact line to this delegate. Passing the whole
+                # original script here can execute later commands prematurely
+                # or bypass handlers such as the GoKlipper restart guard.
+                async def delegate_run_gcode(command_line=command_line):
+                    return await forward(command_line)
 
-                if result is None:
-                    return None
+                last_result = await self.gcode_handlers[cmd](args, delegate_run_gcode)
 
-                return result
-            else:
-                logging.debug(f"hook on gcode cmd not found: {cmd}")
-                return await delegate_run_gcode()
+            if pending:
+                last_result = await forward(''.join(pending))
+            elif not script:
+                last_result = await forward(script)
+            return last_result
 
         def wrap_request(original_request: KlippyConnection.request):
             async def request(me: KlippyConnection, web_request: WebRequest):
-                logging.debug(f"hook on request")
+                if (web_request.get_endpoint() != "gcode/script" or
+                        forwarding_gcode.get()):
+                    return await original_request(me, web_request)
 
-                rpc_method = web_request.get_endpoint()
-                if rpc_method == "gcode/script":
+                args = web_request.get_args()
+                script = web_request.get_str('script', "")
 
-                    script = web_request.get_str('script', "")
-                    if script:
-                        normalized_script = self._normalize_exclude_object_script(script)
-                        normalized_script = self._normalize_print_file_script(normalized_script)
-                        if normalized_script != script:
-                            web_request.get_args()['script'] = normalized_script
-                            script = normalized_script
+                async def forward(command):
+                    had_script = 'script' in args
+                    original_script = args.get('script')
+                    args['script'] = command
+                    try:
+                        return await original_request(me, web_request)
+                    finally:
+                        if had_script:
+                            args['script'] = original_script
+                        else:
+                            args.pop('script', None)
 
-                        async def delegate_run_gcode():
-                            return await original_request(me, web_request)
-
-                        return await handle_gcode(me, script, delegate_run_gcode)
-
-                return await original_request(me, web_request)
-
+                return await handle_gcode(script, forward)
             return request
 
         def wrap_run_gcode(original_run_gcode: KlippyAPI.run_gcode):
             async def run_gcode(me: KlippyAPI, script: str, default: Any = Sentinel.MISSING):
-                logging.debug(f"hook on run gcode: {script}")
+                async def forward(command):
+                    token = forwarding_gcode.set(True)
+                    try:
+                        return await original_run_gcode(me, command, default)
+                    finally:
+                        forwarding_gcode.reset(token)
 
-                # Normalize here (before delegate captures script and before
-                # handle_gcode parses it) so both the delegated non-MQTT
-                # forward and the shlex-based FILENAME parse see a clean name.
-                script = self._normalize_print_file_script(script)
-
-                async def delegate_run_gcode():
-                    return await original_run_gcode(me, script, default)
-
-                return await handle_gcode(me, script, delegate_run_gcode)
-
+                return await handle_gcode(script, forward)
             return run_gcode
 
         logging.info('> Adding gcode handler...')

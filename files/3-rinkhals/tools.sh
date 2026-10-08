@@ -32,6 +32,10 @@ export KOBRA_DEVICE_ID=$(cat /useremain/dev/device_id 2> /dev/null)
 
 export ORIGINAL_ROOT=/tmp/rinkhals/original
 
+if [ -f "$RINKHALS_ROOT/opt/rinkhals/tools/update-lock.sh" ]; then
+    . "$RINKHALS_ROOT/opt/rinkhals/tools/update-lock.sh"
+fi
+
 msleep() {
     usleep $(($1 * 1000))
 }
@@ -52,12 +56,15 @@ quit() {
 }
 
 check_compatibility() {
-    if [ "$KOBRA_MODEL_CODE" != "K2P" ] && [ "$KOBRA_MODEL_CODE" == "K3" ] && [ "$KOBRA_MODEL_CODE" == "KS1" ] && [ "$KOBRA_MODEL_CODE" == "K3M" ]; then
-        log "Your printer's model is not recognized, exiting"
-        quit
-    fi
+    case "$KOBRA_MODEL_CODE" in
+        K2P|K3|KS1|K3M|K3V2|KS1M) return 0 ;;
+        *) log "Your printer's model is not recognized, exiting"; quit ;;
+    esac
 }
-is_supported_firmware() {
+is_supported_firmware() (
+    # Optional arguments let the web preflight use the exact boot policy.
+    KOBRA_MODEL_CODE=${1:-$KOBRA_MODEL_CODE}
+    KOBRA_VERSION=${2:-$KOBRA_VERSION}
     SUPPORTED=0
     [ "$KOBRA_MODEL_CODE" = "KS1M" ] && [ "$KOBRA_VERSION" = "2.7.2.1" ] && SUPPORTED=1
     [ "$KOBRA_MODEL_CODE" = "KS1M" ] && [ "$KOBRA_VERSION" = "2.7.1.4" ] && SUPPORTED=1
@@ -86,7 +93,7 @@ is_supported_firmware() {
     [ "$KOBRA_MODEL_CODE" = "K2P" ] && [ "$KOBRA_VERSION" = "3.1.4" ] && SUPPORTED=1
     [ "$KOBRA_MODEL_CODE" = "K2P" ] && [ "$KOBRA_VERSION" = "3.1.2.3" ] && SUPPORTED=1
     echo $SUPPORTED
-}
+)
 
 get_swu_password() {
     # Per-model SWU encryption password. Must match the stock firmware password
@@ -99,8 +106,13 @@ get_swu_password() {
         K3M)         echo "4DKXtEGStWHpPgZm8Xna9qluzAI8VJzpOsEIgd8brTLiXs8fLSu3vRx8o7fMf4h6" ;;
     esac
 }
-install_swu() {
-    SWU_FILE=$(realpath $1)
+install_swu() (
+    acquire_update_lock || return 1
+    trap release_update_lock EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    SWU_FILE=$(realpath "$1") || return 1
     shift
 
     echo "> Extracting $SWU_FILE ..."
@@ -111,23 +123,31 @@ install_swu() {
         return 1
     fi
 
-    mkdir -p /useremain/update_swu
-    rm -rf /useremain/update_swu/*
+    mkdir -p /useremain/update_swu || return 1
+    rm -rf /useremain/update_swu/* || return 1
 
-    cd /useremain/update_swu
+    cd /useremain/update_swu || return 1
 
-    unzip -P "$SWU_PASSWORD" $SWU_FILE -d /useremain
+    unzip -P "$SWU_PASSWORD" "$SWU_FILE" -d /useremain || return 1
     if [ -f /useremain/update_swu/setup.tar.gz ]; then
-        tar -xzf /useremain/update_swu/setup.tar.gz -C /useremain/update_swu
+        tar -xzf /useremain/update_swu/setup.tar.gz -C /useremain/update_swu || return 1
     elif [ -f /useremain/update_swu/setup.tar ]; then
-        tar -xf /useremain/update_swu/setup.tar -C /useremain/update_swu
+        tar -xf /useremain/update_swu/setup.tar -C /useremain/update_swu || return 1
+    else
+        echo "Missing update payload" >&2
+        return 1
     fi
 
     echo "> Running update.sh ..."
 
-    chmod +x update.sh
-    ./update.sh $@
-}
+    chmod +x update.sh || return 1
+    # Rinkhals' update.sh otherwise launches a detached child and returns 0.
+    # Keep staging ownership until the actual install has finished.
+    if [ "$#" -eq 0 ] && [ -d rinkhals ] && [ -f .version ]; then
+        set -- async
+    fi
+    ./update.sh "$@"
+)
 
 get_command_line() {
     PID=$1
@@ -167,7 +187,7 @@ wait_for_name() {
             return
         fi
 
-        if [ "$TOTAL" -gt 30000 ]; then
+        if [ "$TOTAL" -le 0 ]; then
             if [ "$3" != "" ]; then
                 log "$3"
             else
@@ -365,7 +385,7 @@ enable_app() {
     fi
 
     # If this is a built-in app, handle app.enabled / app.disabled
-    if [[ "$app_root" == "$BUILTIN_APP_PATH*" ]]; then
+    if [ "$app_root" = "$BUILTIN_APP_PATH/$app" ]; then
         if [ -e $RINKHALS_HOME/apps/$app.disabled ]; then
             rm $RINKHALS_HOME/apps/$app.disabled
         fi
@@ -390,7 +410,7 @@ disable_app() {
     fi
 
     # If this is a built-in app, handle app.enabled / app.disabled
-    if [[ "$app_root" == "$BUILTIN_APP_PATH*" ]]; then
+    if [ "$app_root" = "$BUILTIN_APP_PATH/$app" ]; then
         if [ -e $RINKHALS_HOME/apps/$app.enabled ]; then
             rm $RINKHALS_HOME/apps/$app.enabled
         fi
@@ -467,35 +487,26 @@ get_app_property() {
         fi
     fi
 
-    echo $VALUE
+    printf '%s\n' "$VALUE"
 }
+write_app_property() (
+    config_path=$1
+    property=$2
+    value=$3
+    mkdir -p "$(dirname "$config_path")" || return 1
+    config=$(cat "$config_path" 2>/dev/null)
+    config=${config:-'{}'}
+    temporary=$(mktemp "$config_path.XXXXXX") || return 1
+    trap 'rm -f "$temporary"' EXIT
+    printf '%s\n' "$config" | jq --arg property "$property" --arg value "$value" \
+        '.[$property] = $value' > "$temporary" || return 1
+    mv "$temporary" "$config_path"
+)
 set_app_property() {
-    APP=$1
-    PROPERTY=$2
-    VALUE=$3
-    
-    if [ ! -d $RINKHALS_HOME/apps ]; then
-        mkdir -p $RINKHALS_HOME/apps
-    fi
-
-    CONFIG_PATH=$USER_APP_PATH/$APP.config
-    CONFIG=$(cat $CONFIG_PATH 2>/dev/null)
-    CONFIG=${CONFIG:-'{}'}
-
-    echo $CONFIG | jq ".$PROPERTY = \"$VALUE\"" > $CONFIG_PATH
+    write_app_property "$USER_APP_PATH/$1.config" "$2" "$3"
 }
 set_temporary_app_property() {
-    APP=$1
-    PROPERTY=$2
-    VALUE=$3
-
-    mkdir -p $TEMPORARY_APP_PATH
-
-    TEMPORARY_CONFIG_PATH=$TEMPORARY_APP_PATH/$APP.config
-    CONFIG=$(cat $TEMPORARY_CONFIG_PATH 2>/dev/null)
-    CONFIG=${CONFIG:-'{}'}
-
-    echo $CONFIG | jq ".$PROPERTY = \"$VALUE\"" > $TEMPORARY_CONFIG_PATH
+    write_app_property "$TEMPORARY_APP_PATH/$1.config" "$2" "$3"
 }
 remove_app_property() {
     APP=$1

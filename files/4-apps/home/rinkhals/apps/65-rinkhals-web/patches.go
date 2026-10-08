@@ -205,16 +205,8 @@ func handlePatchesList(w http.ResponseWriter, r *http.Request) {
 		hooks = append(hooks, resolveScriptHook(h))
 	}
 
-	// Compatible-for-run = at least one binary patch matches the running
-	// (model, firmware) combination. When that's false, Rinkhals will fall
-	// back to stock at boot time.
-	compat := false
-	for _, b := range binaries {
-		if b.AppliesToThis {
-			compat = true
-			break
-		}
-	}
+	// Use the boot whitelist, not historical patch files retained in the bundle.
+	compat, _ := isSupportedFirmware(model, fw)
 
 	json.NewEncoder(w).Encode(patchesResponse{
 		ModelCode:        model,

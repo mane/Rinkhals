@@ -41,6 +41,11 @@ jobs:
         cache-from: type=registry,ref=ghcr.io/${{ github.repository_owner }}/rinkhals:buildcache
         cache-to: type=registry,ref=ghcr.io/${{ github.repository_owner }}/rinkhals:buildcache,mode=max
 
+    - name: Verify all SWU payloads before releasing
+      env:
+        EXPECTED_VERSION: ${{ github.ref_name }}
+      run: python3 build/verify-swu.py build/dist --expected-version "$EXPECTED_VERSION"
+
     - name: Create release
       env:
         GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

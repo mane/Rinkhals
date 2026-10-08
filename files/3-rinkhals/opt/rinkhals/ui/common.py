@@ -5,6 +5,10 @@ import json
 import re
 import random
 import logging
+import shlex
+import subprocess
+import uuid
+from dataclasses import dataclass, field
 
 from enum import Enum
 from datetime import datetime, timezone
@@ -32,28 +36,112 @@ LD_LIBRARY_PATH = [ p for p in LD_LIBRARY_PATH if not p.startswith('/tmp') ]
 LD_LIBRARY_PATH = ':'.join(LD_LIBRARY_PATH)
 
 
-def system(command):
-    command = command.replace('\\', '\\\\')
+def command_environment(extra=None):
+    env = os.environ.copy()
+    env['LD_LIBRARY_PATH'] = LD_LIBRARY_PATH
+    if extra:
+        env.update(extra)
+    return env
 
-    os.environ['LD_LIBRARY_PATH'] = LD_LIBRARY_PATH
-    result = os.system(command)
-    os.environ['LD_LIBRARY_PATH'] = ORIGINAL_LD_LIBRARY_PATH
-
+def system(command, env=None):
+    result = subprocess.run(['sh', '-c', command], env=command_environment(env)).returncode
     logging.info(f'System "{command}"')
     return result
 def shell(command):
-    command = command.replace('\\', '\\\\')
-    os.environ['LD_LIBRARY_PATH'] = LD_LIBRARY_PATH
-
-    import subprocess
-    process = subprocess.run(['sh', '-c', command], capture_output=True, text=True)
+    process = subprocess.run(['sh', '-c', command], capture_output=True, text=True,
+                             env=command_environment())
     result = (process.stdout or '').strip()
 
     command = command.replace('. /useremain/rinkhals/.current/tools.sh && ', '')
     logging.info(f'Shell "{command}" => "{result}"')
 
-    os.environ['LD_LIBRARY_PATH'] = ORIGINAL_LD_LIBRARY_PATH
     return result
+
+
+class UpdateLock:
+    """Coordinate staging with the Go backend and shell update tools."""
+    path = '/tmp/rinkhals-update.lock'
+
+    def __enter__(self):
+        self.owned = False
+        inherited = os.environ.get('RINKHALS_UPDATE_LOCK_TOKEN')
+        if inherited:
+            try:
+                with open(os.path.join(self.path, 'owner')) as f:
+                    if f.read().strip() == inherited:
+                        self.token = inherited
+                        return self
+            except FileNotFoundError:
+                pass
+        self.token = uuid.uuid4().hex
+        try:
+            os.mkdir(self.path, 0o700)
+        except FileExistsError:
+            raise RuntimeError('Another update or maintenance operation is in progress')
+        try:
+            with open(os.path.join(self.path, 'owner'), 'w') as f:
+                f.write(self.token + '\n')
+        except Exception:
+            os.rmdir(self.path)
+            raise
+        self.owned = True
+        return self
+
+    @property
+    def env(self):
+        return {'RINKHALS_UPDATE_LOCK_TOKEN': self.token}
+
+    def __exit__(self, *args):
+        if not self.owned:
+            return
+        owner = os.path.join(self.path, 'owner')
+        try:
+            with open(owner) as f:
+                if f.read().strip() != self.token:
+                    return
+            os.remove(owner)
+            os.rmdir(self.path)
+        except FileNotFoundError:
+            pass
+
+
+def ensure_startup_hooks(gk_path='/userdata/app/gk', patch_path=None):
+    if patch_path is None:
+        candidates = [os.path.join(SCRIPT_PATH, 'start.sh.patch'),
+                      '/useremain/rinkhals/start.sh.patch']
+        patch_path = next((p for p in candidates if os.path.isfile(p)), None)
+    for name in ('start.sh', 'restart_k3c.sh'):
+        path = os.path.join(gk_path, name)
+        if not os.path.isfile(path):
+            continue
+        with open(path) as f:
+            if 'Rinkhals/begin' in f.read():
+                continue
+        if not patch_path:
+            raise RuntimeError('Rinkhals startup patch is missing')
+        with open(patch_path) as f:
+            patch = f.read()
+        with open(path, 'a') as f:
+            f.write('\n' + patch)
+
+
+class PendingDownload:
+    """Own one modal's temporary SWU, including cancellation during streaming."""
+    def __init__(self, path):
+        self.path = path
+        self.cancelled = False
+        self.in_use = False
+
+    def remove(self):
+        try:
+            os.remove(self.path)
+        except FileNotFoundError:
+            pass
+
+    def cancel(self):
+        self.cancelled = True
+        if not self.in_use:
+            self.remove()
 def shell_async(command, callback):
     def thread():
         result = shell(command)
@@ -220,17 +308,32 @@ class ScreenInfo:
 ################
 # Rinkhals update management
 
+@dataclass
 class RinkhalsVersion:
-    version: str
-    path: str
-    test: bool
-    date: int
-    changes: str
-    sha256: str
-    url: str
-    supported_firmwares: list[str]
+    version: str = ''
+    path: str = ''
+    test: bool = False
+    date: int = 0
+    changes: str = ''
+    sha256: str = ''
+    url: str = ''
+    supported_firmwares: list[str] = field(default_factory=list)
 
 class Rinkhals:
+    def remove_installed_version(version):
+        import shutil
+        path = os.path.realpath(version.path)
+        base = os.path.realpath(RINKHALS_BASE)
+        current = Rinkhals.get_current_path()
+        active_paths = [os.path.realpath(os.path.join(RINKHALS_BASE, '.current'))]
+        if current:
+            active_paths.append(os.path.realpath(current))
+        if path in active_paths:
+            raise ValueError('The active Rinkhals version cannot be removed')
+        if os.path.dirname(path) != base or not os.path.isfile(os.path.join(path, '.version')):
+            raise ValueError('Not an installed Rinkhals version')
+        shutil.rmtree(path)
+
     def get_current_path():
         try:
             version_file = os.path.join(RINKHALS_BASE, '.version')
@@ -269,7 +372,7 @@ class Rinkhals:
         versions = []
         if os.path.exists(RINKHALS_BASE):
             for f in os.scandir(RINKHALS_BASE):
-                if f.is_dir():
+                if f.is_dir() and not f.is_symlink() and os.path.isfile(os.path.join(f.path, '.version')):
                     version = RinkhalsVersion()
                     version.version = f.name
                     version.path = f.path
@@ -278,7 +381,7 @@ class Rinkhals:
     def get_available_versions(include_test=False, limit=10):
         printer_info = PrinterInfo.get()
         if not printer_info or not printer_info.model_code:
-            return None
+            return []
         
         try:
             import requests
@@ -314,9 +417,13 @@ class Rinkhals:
                         asset_url = None
                         asset_digest = None
 
+                        asset_group = {
+                            'K2P': 'k2p-k3', 'K3': 'k2p-k3', 'K3V2': 'k2p-k3',
+                            'K3M': 'k3m', 'KS1': 'ks1', 'KS1M': 'ks1m',
+                        }.get(printer_info.model_code)
                         for asset in assets:
                             asset_name = asset.get('name', '').lower()
-                            if 'update' in asset_name and printer_info.model_code.lower().replace('v2', '') in asset_name:
+                            if asset_name == f'update-{asset_group}.swu':
                                 asset_url = asset.get('browser_download_url', '')
                                 asset_digest = asset.get('digest', '')
                                 break
@@ -327,6 +434,8 @@ class Rinkhals:
                         if asset_digest and 'sha256' in asset_digest:
                             version.sha256 = asset_digest.replace('sha256:', '') if asset_digest else None
 
+                    if not version.url:
+                        continue
                     versions.append(version)
                     if len(versions) >= limit:
                         break
@@ -344,12 +453,13 @@ class Rinkhals:
 ################
 # Firmware update management
 
+@dataclass
 class FirmwareVersion:
-    version: str
-    date: int
-    changes: str
-    md5: str
-    url: str
+    version: str = ''
+    date: int = 0
+    changes: str = ''
+    md5: str = ''
+    url: str = ''
 
 class Firmware:
     repositories = {
@@ -574,7 +684,7 @@ class Diagnostic:
                 with open(custom_cfg_path, 'r') as f:
                     custom_lines = f.readlines()
             
-                custom_lines = [ l for l in custom_lines if custom_lines.strip() and not custom_lines.strip().startswith('#') ]
+                custom_lines = [l for l in custom_lines if l.strip() and not l.strip().startswith('#')]
                 if len(custom_lines) > 0:
                     yield Diagnostic(
                         type=DiagnosticType.WARNING,
@@ -895,6 +1005,10 @@ class BaseApp:
         elif screen == self.screen_ota_firmware: self.show_ota_firmware()
     def show_modal(self, modal):
         if self.modal_current:
+            if self.modal_current is not modal:
+                previous = getattr(self.modal_current, 'pending_download', None)
+                if previous:
+                    previous.cancel()
             self.modal_current.add_flag(lv.OBJ_FLAG.HIDDEN)
 
         self.modal_current = modal
@@ -905,6 +1019,9 @@ class BaseApp:
         self.root_modal.move_foreground()
     def hide_modal(self):
         if self.modal_current:
+            pending = getattr(self.modal_current, 'pending_download', None)
+            if pending:
+                pending.cancel()
             self.modal_current.add_flag(lv.OBJ_FLAG.HIDDEN)
 
         self.root_modal.clear_event_cb()
@@ -1564,6 +1681,13 @@ class BaseApp:
 
         run_async(lambda: refresh_available(False))
     def show_ota_rinkhals_modal(self, version: RinkhalsVersion):
+        target_directory = os.path.join(RINKHALS_BASE, 'tmp')
+        target_path = os.path.join(target_directory, f'rinkhals-{uuid.uuid4().hex}.swu')
+        previous = getattr(self.modal_ota_rinkhals, 'pending_download', None)
+        if previous:
+            previous.cancel()
+        pending = PendingDownload(target_path)
+        self.modal_ota_rinkhals.pending_download = pending
         self.modal_ota_rinkhals.label_title.set_text(f'Rinkhals {version.version}')
 
         changes = version.changes or ''
@@ -1597,7 +1721,6 @@ class BaseApp:
 
         if rinkhals_current and version.version == rinkhals_current.version:
             action_text = 'Re-install'
-            action_uninstall = True
         elif any([ v for v in rinkhals_installed if version.version == v.version ]):
             action_text = 'Re-install'
             action_uninstall = True
@@ -1621,6 +1744,8 @@ class BaseApp:
 
         def download_version():
             with lvr.lock():
+                if pending.cancelled:
+                    return
                 self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, True)
                 self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, True)
                 self.modal_ota_rinkhals.panel_progress.remove_flag(lv.OBJ_FLAG.HIDDEN)
@@ -1628,15 +1753,16 @@ class BaseApp:
                 self.modal_ota_rinkhals.obj_progress_bar.set_width(lv.pct(0))
                 self.modal_ota_rinkhals.label_progress_text.set_text('Starting...')
 
-            target_directory = f'{RINKHALS_BASE}/tmp'
-            os.makedirs(target_directory, exist_ok=True)
-            target_path = f'{target_directory}/update-download.swu' if USING_SIMULATOR else '/useremain/update.swu'
-
+            completed = False
+            pending.in_use = True
             try:
+                if pending.cancelled:
+                    return
+                os.makedirs(target_directory, exist_ok=True)
                 logging.info(f'Downloading Rinkhals {version.version} from {version.url}...')
 
                 import requests
-                with requests.get(version.url, stream=True) as r:
+                with requests.get(version.url, stream=True, timeout=(10, 60)) as r:
                     r.raise_for_status()
                     with open(target_path, 'wb') as f:
                         total_length = int(r.headers.get('content-length', 0))
@@ -1645,7 +1771,7 @@ class BaseApp:
 
                         for chunk in r.iter_content(chunk_size=8192):
                             if chunk:
-                                if self.modal_ota_rinkhals.has_flag(lv.OBJ_FLAG.HIDDEN):
+                                if pending.cancelled or self.modal_ota_rinkhals.has_flag(lv.OBJ_FLAG.HIDDEN):
                                     logging.info('Download canceled.')
                                     return
                                 
@@ -1656,11 +1782,13 @@ class BaseApp:
                                 if current_time - last_update_time >= 0.75:
                                     last_update_time = current_time
 
-                                    progress = int(downloaded / total_length * 100)
+                                    progress = int(downloaded / total_length * 100) if total_length else 0
                                     downloaded_mb = downloaded / (1024 * 1024)
                                     total_mb = total_length / (1024 * 1024)
 
                                     with lvr.lock():
+                                        if pending.cancelled:
+                                            return
                                         self.modal_ota_rinkhals.obj_progress_bar.set_width(lv.pct(progress))
                                         self.modal_ota_rinkhals.label_progress_text.set_text(f'{progress}% ({downloaded_mb:.1f}M / {total_mb:.1f}M)')
 
@@ -1668,6 +1796,8 @@ class BaseApp:
 
                 if version.sha256:
                     with lvr.lock():
+                        if pending.cancelled:
+                            return
                         self.modal_ota_rinkhals.label_progress_text.set_text('Checking...')
 
                     file_sha256 = hash_sha256(target_path)
@@ -1675,59 +1805,65 @@ class BaseApp:
                         raise Exception('Hash check failed')
 
                 with lvr.lock():
+                    if pending.cancelled:
+                        return
                     self.modal_ota_rinkhals.obj_progress_bar.set_width(lv.pct(100))
                     self.modal_ota_rinkhals.label_progress_text.set_text('Ready to install')
                     self.modal_ota_rinkhals.button_action.set_text(action_text)
                     self.modal_ota_rinkhals.button_action.set_style_text_color(lvr.COLOR_DANGER if warning_text else lvr.COLOR_TEXT, lv.STATE.DEFAULT)
                     self.modal_ota_rinkhals.button_action.clear_event_cb()
                     self.modal_ota_rinkhals.button_action.add_event_cb(lambda e: run_async(install_version), lv.EVENT_CODE.CLICKED, None)
+                    completed = True
             except Exception as e:
                 logging.info(f'Download failed. {e}')
 
                 with lvr.lock():
+                    if pending.cancelled:
+                        return
                     self.modal_ota_rinkhals.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
                     self.modal_ota_rinkhals.label_progress_text.set_text('Failed')
+            finally:
+                pending.in_use = False
+                if not completed or pending.cancelled:
+                    pending.remove()
                 
             with lvr.lock():
+                if pending.cancelled:
+                    return
                 self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, False)
                 self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, False)
         def install_version():
-            for i in range(1):
-                with lvr.lock():
-                    self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, True)
-                    self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, True)
-                    self.root_modal.clear_event_cb()
-
-                logging.info(f'Extracting Rinkhals update...')
-                with lvr.lock():
-                    self.modal_ota_rinkhals.label_progress_text.set_text('Extracting...')
-
+            with lvr.lock():
+                if pending.cancelled:
+                    return
+                self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, True)
+                self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, True)
+                self.root_modal.clear_event_cb()
+            try:
                 if USING_SIMULATOR:
-                    time.sleep(1)
-                else:
-                    if not self.extract_swu():
-                        break
-
-                logging.info('Starting Rinkhals update...')
-                with lvr.lock():
-                    self.modal_ota_rinkhals.label_progress_text.set_text('Installing...')
-
-                if USING_SIMULATOR:
-                    time.sleep(1)
                     self.quit()
-                else:
-                    self.install_swu('async')
-
-                return
-            
-            lv.lock()
-            self.modal_ota_rinkhals.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
-            self.modal_ota_rinkhals.label_progress_text.set_text('Extraction failed')
-            self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, False)
-            self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, False)
-            lv.unlock()
+                    return
+                def progress(message):
+                    with lvr.lock():
+                        self.modal_ota_rinkhals.label_progress_text.set_text(message)
+                if self.install_download(target_path, 'async', progress):
+                    return
+            except Exception as e:
+                logging.exception('Rinkhals installation failed: %s', e)
+            with lvr.lock():
+                self.modal_ota_rinkhals.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
+                self.modal_ota_rinkhals.label_progress_text.set_text('Installation failed; see log')
+                self.modal_ota_rinkhals.button_action.set_text('Download')
+                self.modal_ota_rinkhals.button_action.clear_event_cb()
+                self.modal_ota_rinkhals.button_action.add_event_cb(lambda e: run_async(download_version), lv.EVENT_CODE.CLICKED, None)
+                self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, False)
+                self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, False)
+                self.root_modal.add_event_cb(lambda e: self.hide_modal(), lv.EVENT_CODE.CLICKED, None)
         def uninstall_version():
             lv.lock()
+            if pending.cancelled:
+                lv.unlock()
+                return
             self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, True)
             self.modal_ota_rinkhals.button_uninstall.set_state(lv.STATE.DISABLED, True)
             self.modal_ota_rinkhals.panel_progress.remove_flag(lv.OBJ_FLAG.HIDDEN)
@@ -1737,26 +1873,38 @@ class BaseApp:
             self.root_modal.clear_event_cb()
             lv.unlock()
 
-            logging.info(f'Removing Rinkhals {version.version} from {version.path}...')
-            import shutil
-            shutil.rmtree(version.path, ignore_errors=True)
-            logging.info(f'Removed Rinkhals {version.version} from {version.path}')
-
-            self.hide_modal()
-            self.show_screen(self.screen_ota_rinkhals)
-            self.layout_ota_rinkhals(force=True)
+            try:
+                with UpdateLock():
+                    Rinkhals.remove_installed_version(version)
+                with lvr.lock():
+                    self.hide_modal()
+                    self.show_screen(self.screen_ota_rinkhals)
+                    self.show_ota_rinkhals(force=True)
+            except Exception as e:
+                logging.error('Unable to remove Rinkhals: %s', e)
+                with lvr.lock():
+                    self.show_text_dialog(str(e))
 
         self.modal_ota_rinkhals.panel_progress.add_flag(lv.OBJ_FLAG.HIDDEN)
         self.modal_ota_rinkhals.button_action.set_text('Download')
         self.modal_ota_rinkhals.button_action.set_style_text_color(lvr.COLOR_TEXT, lv.STATE.DEFAULT)
-        self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, False)
+        self.modal_ota_rinkhals.button_action.set_state(lv.STATE.DISABLED, not bool(version.url))
         self.modal_ota_rinkhals.button_action.clear_event_cb()
         self.modal_ota_rinkhals.button_action.add_event_cb(lambda e: run_async(download_version), lv.EVENT_CODE.CLICKED, None)
-        self.modal_ota_rinkhals.button_uninstall.add_event_cb(lambda e: run_async(uninstall_version), lv.EVENT_CODE.CLICKED, None)
+        self.modal_ota_rinkhals.button_uninstall.clear_event_cb()
+        if action_uninstall:
+            self.modal_ota_rinkhals.button_uninstall.add_event_cb(lambda e: run_async(uninstall_version), lv.EVENT_CODE.CLICKED, None)
 
+        self.root_modal.clear_event_cb()
         self.root_modal.add_event_cb(lambda e: self.hide_modal(), lv.EVENT_CODE.CLICKED, None)
         self.show_modal(self.modal_ota_rinkhals)
     def show_ota_firmware_modal(self, version: FirmwareVersion):
+        local_target_path = os.path.join(RINKHALS_BASE, 'tmp', f'firmware-{uuid.uuid4().hex}.swu')
+        previous = getattr(self.modal_ota_firmware, 'pending_download', None)
+        if previous:
+            previous.cancel()
+        pending = PendingDownload(local_target_path)
+        self.modal_ota_firmware.pending_download = pending
         self.modal_ota_firmware.label_title.set_text(version.version)
 
         changes = version.changes or ''
@@ -1782,6 +1930,9 @@ class BaseApp:
 
         def download_version(target='local'):
             lv.lock()
+            if pending.cancelled:
+                lv.unlock()
+                return
             self.modal_ota_firmware.button_action.set_state(lv.STATE.DISABLED, True)
             self.modal_ota_firmware.button_usb.set_state(lv.STATE.DISABLED, True)
             self.modal_ota_firmware.panel_progress.remove_flag(lv.OBJ_FLAG.HIDDEN)
@@ -1807,9 +1958,13 @@ class BaseApp:
             else:
                 target_directory = f'{RINKHALS_BASE}/tmp'
                 os.makedirs(target_directory, exist_ok=True)
-                target_path = f'{target_directory}/update-download.swu' if USING_SIMULATOR else '/useremain/update.swu'
+                target_path = local_target_path
 
+            completed = False
+            pending.in_use = True
             try:
+                if pending.cancelled:
+                    return
                 logging.info(f'Downloading Firmware {version.version} from {version.url}...')
 
                 import requests
@@ -1823,7 +1978,7 @@ class BaseApp:
                 if 'anycubic' in version.url:
                     headers = {}
 
-                with requests.get(version.url, stream=True, headers=headers) as r:
+                with requests.get(version.url, stream=True, headers=headers, timeout=(10, 60)) as r:
                     r.raise_for_status()
                     with open(target_path, 'wb') as f:
                         downloaded = 0
@@ -1839,7 +1994,7 @@ class BaseApp:
 
                         for chunk in r.iter_content(chunk_size=8192):
                             if chunk:
-                                if self.modal_ota_firmware.has_flag(lv.OBJ_FLAG.HIDDEN):
+                                if pending.cancelled or self.modal_ota_firmware.has_flag(lv.OBJ_FLAG.HIDDEN):
                                     logging.info('Download canceled.')
                                     return
                                 
@@ -1855,6 +2010,9 @@ class BaseApp:
                                     total_mb = total_length / (1024 * 1024)
 
                                     lv.lock()
+                                    if pending.cancelled:
+                                        lv.unlock()
+                                        return
                                     self.modal_ota_firmware.obj_progress_bar.set_width(lv.pct(progress))
                                     if estimate:
                                         self.modal_ota_firmware.label_progress_text.set_text(f'~{progress}% ({downloaded_mb:.1f}M / ~{total_mb:.1f}M)')
@@ -1867,6 +2025,10 @@ class BaseApp:
                 if target == 'usb':
                     system('sync')
                     lv.lock()
+                    if pending.cancelled:
+                        lv.unlock()
+                        return
+                    completed = True
                     self.modal_ota_firmware.obj_progress_bar.set_width(lv.pct(100))
                     self.modal_ota_firmware.label_progress_text.set_text('Saved to USB')
                     self.modal_ota_firmware.button_usb.set_state(lv.STATE.DISABLED, False)
@@ -1874,6 +2036,10 @@ class BaseApp:
                     lv.unlock()
                 else:
                     lv.lock()
+                    if pending.cancelled:
+                        lv.unlock()
+                        return
+                    completed = True
                     self.modal_ota_firmware.obj_progress_bar.set_width(lv.pct(100))
                     self.modal_ota_firmware.label_progress_text.set_text('Ready to install')
                     self.modal_ota_firmware.button_action.set_text('Install')
@@ -1885,51 +2051,53 @@ class BaseApp:
                 logging.info(f'Download failed. {e}')
 
                 lv.lock()
+                if pending.cancelled:
+                    lv.unlock()
+                    return
                 self.modal_ota_firmware.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
                 self.modal_ota_firmware.label_progress_text.set_text('Failed')
                 self.modal_ota_firmware.button_action.set_state(lv.STATE.DISABLED, False)
                 self.modal_ota_firmware.button_usb.set_state(lv.STATE.DISABLED, False)
                 lv.unlock()
+            finally:
+                pending.in_use = False
+                if not completed or pending.cancelled:
+                    try:
+                        os.remove(target_path)
+                    except FileNotFoundError:
+                        pass
                 
             lv.lock()
+            if pending.cancelled:
+                lv.unlock()
+                return
             self.modal_ota_firmware.button_action.set_state(lv.STATE.DISABLED, False)
             lv.unlock()
         def install_version():
-            for i in range(1):
-                lv.lock()
+            with lvr.lock():
+                if pending.cancelled:
+                    return
                 self.modal_ota_firmware.button_action.set_state(lv.STATE.DISABLED, True)
                 self.modal_ota_firmware.button_cancel.set_state(lv.STATE.DISABLED, True)
-                self.modal_ota_firmware.label_progress_text.set_text('Extracting...')
-                lv.unlock()
-
-                logging.info(f'Extracting system update...')
-
+            try:
                 if USING_SIMULATOR:
-                    time.sleep(1)
-                else:
-                    if not self.extract_swu():
-                        break
-
-                lv.lock()
-                self.modal_ota_firmware.label_progress_text.set_text('Installing...')
-                lv.unlock()
-
-                logging.info('Starting system update...')
-
-                if USING_SIMULATOR:
-                    time.sleep(1)
                     self.quit()
-                else:
-                    self.install_swu()
-
-                return
-            
-            lv.lock()
-            self.modal_ota_firmware.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
-            self.modal_ota_firmware.label_progress_text.set_text('Extraction failed')
-            self.modal_ota_firmware.button_action.set_state(lv.STATE.DISABLED, False)
-            self.modal_ota_firmware.button_cancel.set_state(lv.STATE.DISABLED, False)
-            lv.unlock()
+                    return
+                def progress(message):
+                    with lvr.lock():
+                        self.modal_ota_firmware.label_progress_text.set_text(message)
+                if self.install_download(local_target_path, progress=progress):
+                    return
+            except Exception as e:
+                logging.exception('Firmware installation failed: %s', e)
+            with lvr.lock():
+                self.modal_ota_firmware.obj_progress_bar.set_style_bg_color(lvr.COLOR_DANGER, lv.STATE.DEFAULT)
+                self.modal_ota_firmware.label_progress_text.set_text('Installation failed; see log')
+                self.modal_ota_firmware.button_action.set_text('Download')
+                self.modal_ota_firmware.button_action.clear_event_cb()
+                self.modal_ota_firmware.button_action.add_event_cb(lambda e: run_async(lambda: download_version('local')), lv.EVENT_CODE.CLICKED, None)
+                self.modal_ota_firmware.button_action.set_state(lv.STATE.DISABLED, False)
+                self.modal_ota_firmware.button_cancel.set_state(lv.STATE.DISABLED, False)
 
         self.modal_ota_firmware.button_action.set_style_text_color(lvr.COLOR_TEXT, lv.STATE.DEFAULT)
         self.modal_ota_firmware.panel_progress.add_flag(lv.OBJ_FLAG.HIDDEN)
@@ -1946,27 +2114,38 @@ class BaseApp:
 
         self.show_modal(self.modal_ota_firmware)
 
-    def extract_swu(self):
+    def install_download(self, source_path, params='', progress=None):
+        with UpdateLock() as lock:
+            if progress:
+                progress('Extracting...')
+            if not self.extract_swu(source_path):
+                return False
+            if progress:
+                progress('Installing...')
+            return self.install_swu(params, env=lock.env)
+
+    def extract_swu(self, source_path='/useremain/update.swu'):
         if self.printer_info.model_code == 'K2P' or self.printer_info.model_code == 'K3' or self.printer_info.model_code == 'K3V2':
             password = 'U2FsdGVkX19deTfqpXHZnB5GeyQ/dtlbHjkUnwgCi+w='
         elif self.printer_info.model_code == 'KS1' or self.printer_info.model_code == 'KS1M':
             password = 'U2FsdGVkX1+lG6cHmshPLI/LaQr9cZCjA8HZt6Y8qmbB7riY'
         elif self.printer_info.model_code == 'K3M':
             password = '4DKXtEGStWHpPgZm8Xna9qluzAI8VJzpOsEIgd8brTLiXs8fLSu3vRx8o7fMf4h6'
+        else:
+            logging.error('Unsupported printer model')
+            return False
             
         if system('rm -rf /useremain/update_swu') != 0:
             return False
-        if system(f'unzip -P {password} /useremain/update.swu -d /useremain') != 0:
-            return False
-        if system('rm /useremain/update.swu') != 0:
+        if system(f'unzip -P {shlex.quote(password)} {shlex.quote(source_path)} -d /useremain') != 0:
             return False
 
         if os.path.isfile('/useremain/update_swu/setup.tar.gz.md5'):
             with open('/useremain/update_swu/setup.tar.gz.md5', 'r') as f:
-                theoritical_hash = f.read().strip()
+                theoritical_hash = f.read().strip().split()[0]
 
             file_hash = hash_md5('/useremain/update_swu/setup.tar.gz')
-            if file_hash.lower() != theoritical_hash.lower():
+            if not file_hash or file_hash.lower() != theoritical_hash.lower():
                 logging.error('setup.tar.gz md5 doesn\'t match. Failing install.')
                 return False
 
@@ -1975,8 +2154,9 @@ class BaseApp:
         if system('chmod +x /useremain/update_swu/update.sh') != 0:
             return False
 
+        os.remove(source_path)
         return True
-    def install_swu(self, params=''):
+    def install_swu(self, params='', env=None):
         # Patch the update script
         with open('/useremain/update_swu/update.sh', 'r+') as f:
             update_script = f.read()
@@ -1989,23 +2169,16 @@ class BaseApp:
             f.write(update_script)
 
         # Run the update script
-        system(f'/useremain/update_swu/update.sh {params}')
+        if system(f'/useremain/update_swu/update.sh {params}', env=env) != 0:
+            logging.error('Update script failed; keeping the printer running')
+            return False
 
         if os.path.exists('/useremain/rinkhals/.version'):
-            if os.path.exists('/userdata/app/gk/start.sh'):
-                with open('/userdata/app/gk/start.sh', 'r') as f:
-                    script_content = f.read()
-                    if 'Rinkhals/begin' not in script_content:
-                        system(f'cat {SCRIPT_PATH}/start.sh.patch >> /userdata/app/gk/start.sh')
-            if os.path.exists('/userdata/app/gk/restart_k3c.sh'):
-                with open('/userdata/app/gk/start.sh', 'r') as f:
-                    script_content = f.read()
-                    if 'Rinkhals/begin' not in script_content:
-                        system(f'cat {SCRIPT_PATH}/start.sh.patch >> /userdata/app/gk/restart_k3c.sh')
+            ensure_startup_hooks()
 
         # Store the reboot marker
         os.makedirs('/useremain/rinkhals', exist_ok=True)
         open('/useremain/rinkhals/.reboot-marker', 'w').close()
 
         # Sync and reboot
-        system('sync && reboot')
+        return system('sync && reboot') == 0

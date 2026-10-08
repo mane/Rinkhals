@@ -149,10 +149,21 @@ moonraker-packages: (require "app-moonraker" FILES_DIR / "4-apps/home/rinkhals/a
 
 # ─── Apps ─────────────────────────────────────────────────────────────────────
 
-# Download all apps
+# Download apps and compile the web portal
 [group('apps')]
-apps: app-mainsail app-fluidd app-moonraker app-remote-display
-    @echo "All apps downloaded: $FILES_DIR"
+apps: app-mainsail app-fluidd app-moonraker app-remote-display app-rinkhals-web
+    @echo "All apps prepared: $FILES_DIR"
+
+# Build the Svelte UI and ARM Go backend using the release pipeline
+[group('apps'), script]
+app-rinkhals-web:
+    APP_DIRECTORY="$FILES_DIR/4-apps/home/rinkhals/apps/65-rinkhals-web"
+    mkdir -p "$APP_DIRECTORY"
+    docker build --target web-export --output "type=local,dest=$APP_DIRECTORY" "{{workspace}}"
+    test -s "$APP_DIRECTORY/rinkhals-web"
+    test -s "$APP_DIRECTORY/ui/index.html"
+    chmod +x "$APP_DIRECTORY/rinkhals-web"
+    echo "Rinkhals web portal built"
 
 # Download Fluidd web UI
 [group('apps'), script]
@@ -194,7 +205,9 @@ app-remote-display:
 bundle version="dev": \
     (require "buildroot" FILES_DIR / "1-buildroot/bin") \
     (require "python-packages" FILES_DIR / "2-python/usr/lib") \
-    (require "apps" FILES_DIR / "4-apps")
+    (require "apps" FILES_DIR / "4-apps") \
+    (require "app-rinkhals-web" FILES_DIR / "4-apps/home/rinkhals/apps/65-rinkhals-web/rinkhals-web") \
+    (require "app-rinkhals-web" FILES_DIR / "4-apps/home/rinkhals/apps/65-rinkhals-web/ui/index.html")
     mkdir -p $BUNDLE_DIR/rinkhals
     cp -a $FILES_DIR/1-buildroot/. $BUNDLE_DIR/rinkhals/
     cp -a $FILES_DIR/2-python/. $BUNDLE_DIR/rinkhals/
@@ -202,18 +215,34 @@ bundle version="dev": \
     cp -a {{workspace}}/files/3-rinkhals/. $BUNDLE_DIR/rinkhals/
     cp -a {{workspace}}/files/4-apps/. $BUNDLE_DIR/rinkhals/
     cp {{workspace}}/files/*.* $BUNDLE_DIR/
+    WEB_DIRECTORY="$BUNDLE_DIR/rinkhals/home/rinkhals/apps/65-rinkhals-web"
+    rm -f "$WEB_DIRECTORY"/*.go "$WEB_DIRECTORY"/go.* "$WEB_DIRECTORY"/update-layout.js
+    test -s "$WEB_DIRECTORY/rinkhals-web"
+    test -s "$WEB_DIRECTORY/ui/index.html"
     {{workspace}}/build/prepare-bundle.sh $BUNDLE_DIR "{{version}}"
     echo "Bundle ready: $BUNDLE_DIR (version: {{version}})"
 
 # Build all SWU outputs (update, installer, tools)
 [group('assembly')]
 swu-all: swu-update swu-installer swu-tools
+    python3 {{workspace}}/build/verify-swu.py "$SWU_DIR"
     @echo "All SWU files built: $SWU_DIR"
+
+# Validate encrypted archives and required runtime files without executing payloads
+[group('assembly')]
+swu-verify:
+    python3 {{workspace}}/build/verify-swu.py "$SWU_DIR"
 
 # Build installer SWU files for all printer models (requires: buildroot, python-packages)
 [group('assembly'), script]
 swu-installer: (require "buildroot" FILES_DIR / "1-buildroot/bin") (require "python-packages" FILES_DIR / "2-python/usr/lib")
     mkdir -p $SWU_DIR
+    if [ -f "$BUNDLE_DIR/.version" ]; then
+        RINKHALS_VERSION=$(cat "$BUNDLE_DIR/.version")
+    else
+        RINKHALS_VERSION=${RINKHALS_VERSION:-dev}
+    fi
+    export RINKHALS_VERSION
     parallel --halt now,fail=1 --tagstring '[installer-{2}]' \
         'KOBRA_MODEL_CODE={1} {{workspace}}/build/swu-tools/installer/build-swu.sh '$SWU_DIR'/installer-{2}.swu' \
         ::: K3 K3M KS1 KS1M :::+ k2p-k3 k3m ks1 ks1m

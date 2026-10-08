@@ -1886,7 +1886,9 @@ class MmuAcePatcher:
             await self._send_gcode_response(message)
 
             # Call MMU_UNLOAD with the currently loaded gate
-            await self._on_gcode_mmu_unload({"GATE": str(self.ace.loaded_gate)}, None)
+            if not await self._unload_filament({"GATE": str(self.ace.loaded_gate)}):
+                await self._send_gcode_response("MMU_LOAD: Unload failed - aborting gate change")
+                return None
 
             # After unload, continue with load of new gate
             message = f"MMU_LOAD: Unload complete. Now loading gate {gate}..."
@@ -1929,6 +1931,10 @@ class MmuAcePatcher:
         return None  # Don't execute original command
 
     async def _on_gcode_mmu_unload(self, args: dict[str, str | None], delegate):
+        await self._unload_filament(args)
+        return None  # Don't execute the original MMU command
+
+    async def _unload_filament(self, args: dict[str, str | None]) -> bool:
         """Manual unload filament: MMU_UNLOAD [GATE=0] [LENGTH=100] [SPEED=20]
 
         Uses GoKlipper's UNWIND_FILAMENT or UNWIND_ALL_FILAMENT G-code command internally.
@@ -2017,7 +2023,7 @@ class MmuAcePatcher:
                         message = f"ERROR: Heating timeout after {max_wait}s (current: {current_temp:.1f}°C, target: {max_min_temp}°C)"
                         logging.error(message)
                         await self._send_gcode_response(message)
-                        return None
+                        return False
                 else:
                     message = f"Extruder temperature OK: {current_temp:.1f}°C (>= {max_min_temp}°C)"
                     logging.info(message)
@@ -2027,7 +2033,7 @@ class MmuAcePatcher:
                 message = f"ERROR: Failed to check/heat extruder: {e}"
                 logging.error(message)
                 await self._send_gcode_response(message)
-                return None
+                return False
 
             try:
                 # Unload all filaments
@@ -2047,15 +2053,16 @@ class MmuAcePatcher:
                 message = f"MMU_UNLOAD failed: {e}"
                 logging.error(message)
                 await self._send_gcode_response(message)
+                return False
 
-            return None  # Don't execute original command
+            return True
 
         # Ensure extruder is heated to gate-specific temperature
         if not await self._ensure_extruder_temp(gate):
             message = "MMU_UNLOAD: Extruder temperature check failed - aborting"
             logging.error(message)
             await self._send_gcode_response(message)
-            return None
+            return False
 
         # Determine local gate index (GoKlipper's UNWIND_FILAMENT uses INDEX 0-3, not global gate)
         ace_id = gate // 4
@@ -2082,8 +2089,9 @@ class MmuAcePatcher:
             message = f"MMU_UNLOAD failed: {e}"
             logging.error(message)
             await self._send_gcode_response(message)
+            return False
 
-        return None  # Don't execute original command
+        return True
 
     async def _on_gcode_mmu_eject(self, args: dict[str, str | None], delegate):
         """Manual eject filament: MMU_EJECT GATE=0 [LENGTH=500] [SPEED=20]
@@ -2119,10 +2127,14 @@ class MmuAcePatcher:
             # Send directly to GoKlipper via G-code
             await self.ace_controller.printer.send_gcode(gcode)
 
-            # Reset MMU status after eject
+            # Clear loaded state only when the ejected gate was threaded.
             self.ace.gate = -1
             self.ace.tool = -1
-            self.ace.filament.pos = FILAMENT_POS_UNLOADED
+            if self.ace.loaded_gate == gate:
+                self.ace.loaded_gate = TOOL_GATE_UNKNOWN
+            self.ace.filament.pos = (FILAMENT_POS_UNLOADED
+                                     if self.ace.loaded_gate == TOOL_GATE_UNKNOWN
+                                     else FILAMENT_POS_LOADED)
             self.ace_controller._handle_status_update(force=True)
 
             message = f"MMU_EJECT: Ejecting {length}mm from gate {gate} (index {local_index}) at {speed}mm/s completed, MMU status reset"

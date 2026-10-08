@@ -71,7 +71,7 @@
 		fit.fit();
 
 		const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-		const wsHost = import.meta.env.DEV ? 'localhost:8090' : window.location.host;
+		const wsHost = window.location.host;
 		const ws = new WebSocket(`${protocol}//${wsHost}/api/terminal`);
 		ws.binaryType = 'arraybuffer';
 

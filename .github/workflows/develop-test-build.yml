@@ -74,6 +74,11 @@ jobs:
           outputs: type=local,dest=./build/dist
           cache-from: type=registry,ref=ghcr.io/rinkhals-community/rinkhals:buildcache
 
+      - name: Verify all SWU payloads before releasing
+        env:
+          EXPECTED_VERSION: ${{ steps.version.outputs.version }}
+        run: python3 build/verify-swu.py build/dist --expected-version "$EXPECTED_VERSION"
+
       - name: Create beta release and tag
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

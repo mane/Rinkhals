@@ -12,6 +12,11 @@ USB_PATH="/mnt/udisk/aGVscF9zb3Nf"
 
 
 . $SOURCE_PATH/rinkhals/tools.sh
+. "$SOURCE_PATH/rinkhals/opt/rinkhals/tools/update-lock.sh"
+acquire_update_lock || exit 1
+trap release_update_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 
 log() {
@@ -134,7 +139,7 @@ check_compatibility
 
 
 # Check if we have enough space
-FREE_SPACE=$(df -k /useremain | tail -1 | awk '{print $3}')
+FREE_SPACE=$(df -Pk /useremain | tail -1 | awk '{print $4}')
 if [ "$FREE_SPACE" != "" ] && [ "$FREE_SPACE" -lt "500000" ]; then
     log "Not enough free space in /useremain"
     quit

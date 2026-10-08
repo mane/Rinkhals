@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -103,10 +104,10 @@ type RinkhalsCatalog struct {
 // build mutexes serialise the network fetches so concurrent reads don't all
 // trigger an upstream round-trip when the cache expires.
 var (
-	firmwareStatusDataMu    sync.Mutex
-	firmwareStatusBuildMu   sync.Mutex
-	firmwareStatusCached    *FirmwareStatus
-	firmwareStatusCachedAt  time.Time
+	firmwareStatusDataMu   sync.Mutex
+	firmwareStatusBuildMu  sync.Mutex
+	firmwareStatusCached   *FirmwareStatus
+	firmwareStatusCachedAt time.Time
 
 	firmwareAnycubicDataMu   sync.Mutex
 	firmwareAnycubicBuildMu  sync.Mutex
@@ -211,17 +212,26 @@ func fetchAnycubicCatalog(modelCode string) (*AnycubicCatalog, error) {
 // `date` field is upload-to-CDN timestamp which doesn't always track release
 // order - so we sort on the version string instead.
 func compareVersionsDesc(a, b string) bool {
+	// Rinkhals tags carry a release sequence after the date. Ignore only the
+	// optional channel suffix, so stable/test builds of the same release agree.
+	if ad, an, ok := rinkhalsVersionParts(a); ok {
+		if bd, bn, ok := rinkhalsVersionParts(b); ok {
+			return ad > bd || (ad == bd && an > bn)
+		}
+	}
 	pa := strings.Split(a, ".")
 	pb := strings.Split(b, ".")
 	for i := 0; i < len(pa) || i < len(pb); i++ {
 		var ai, bi int
 		var aok, bok bool
 		if i < len(pa) {
-			_, err := fmt.Sscanf(pa[i], "%d", &ai)
+			var err error
+			ai, err = strconv.Atoi(pa[i])
 			aok = err == nil
 		}
 		if i < len(pb) {
-			_, err := fmt.Sscanf(pb[i], "%d", &bi)
+			var err error
+			bi, err = strconv.Atoi(pb[i])
 			bok = err == nil
 		}
 		if aok && bok {
@@ -244,6 +254,16 @@ func compareVersionsDesc(a, b string) bool {
 		}
 	}
 	return false
+}
+
+func rinkhalsVersionParts(version string) (date, sequence int, ok bool) {
+	parts := strings.SplitN(version, "_", 3)
+	if len(parts) < 2 || len(parts[0]) != 8 || len(parts[1]) != 2 {
+		return 0, 0, false
+	}
+	date, dateErr := strconv.Atoi(parts[0])
+	sequence, sequenceErr := strconv.Atoi(parts[1])
+	return date, sequence, dateErr == nil && sequenceErr == nil
 }
 
 func sortVersionsNewestFirst(v []AnycubicFirmwareVersion) {

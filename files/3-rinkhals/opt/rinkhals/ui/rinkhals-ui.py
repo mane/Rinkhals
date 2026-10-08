@@ -3,6 +3,7 @@ import time
 import sys
 import json
 import logging
+import shlex
 
 import lvgl as lv
 import lvgl_rinkhals as lvr
@@ -108,7 +109,7 @@ else:
 
     def load_tool_function(function_name):
         def tool_function(*args):
-            return shell(f'. /useremain/rinkhals/.current/tools.sh && {function_name} ' + ' '.join([ str(a) for a in args ]))
+            return shell(f'. /useremain/rinkhals/.current/tools.sh && {function_name} ' + ' '.join(shlex.quote(str(a)) for a in args))
         return tool_function
 
     list_apps = load_tool_function('list_apps')

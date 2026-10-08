@@ -1,14 +1,5 @@
 name: PR checks
 
-# Nothing ran on pull requests before this: build-swu and develop-test-build are
-# workflow_dispatch, auto-release is push-on-tag, gh-pages-deploy is push-to-master.
-# So dependency bumps that break the frontend build or the Python components were
-# only discovered at release time, when the Docker image build failed.
-#
-# These are the two cheap checks that would have caught that, and nothing more -
-# no SWU build here, since that needs the ARM toolchain and takes far too long
-# for a PR gate.
-
 on:
   pull_request:
     branches:
@@ -21,62 +12,110 @@ permissions:
 
 jobs:
   web-portal:
-    name: Web portal builds
+    name: Web portal and Go backend
     runs-on: ubuntu-latest
     steps:
-      # Full history: the change detection below needs a common ancestor with the
-      # base branch, which a shallow clone does not have.
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
 
-      - name: Detect web-portal changes
-        id: changed
-        run: |
-          # Fail SAFE, not open: only skip the build when we can positively prove
-          # web-portal/ is untouched. The first version of this compared against a
-          # depth-1 fetch of the base, so there was no merge base, the diff came
-          # back empty, and the build was silently skipped on PRs that did change
-          # web-portal - a check that quietly does nothing is worse than no check.
-          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          BASE="${{ github.event.pull_request.base.sha }}"
-          if [ -z "$BASE" ] || ! git cat-file -e "$BASE^{commit}" 2>/dev/null; then
-            echo "Could not resolve base commit, building anyway" >&2
-            echo "run=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          CHANGED=$(git diff --name-only "$BASE" HEAD -- web-portal/ || true)
-          if [ -n "$CHANGED" ]; then
-            echo "web-portal changed:"; echo "$CHANGED"
-            echo "run=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "no web-portal changes, skipping build"
-            echo "run=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # Keep in step with the Dockerfile's build-web-ui stage (node:22-bookworm).
+      # Match the release Dockerfile's build-web-ui stage.
       - uses: actions/setup-node@v4
-        if: steps.changed.outputs.run == 'true'
         with:
           node-version: '22'
           cache: npm
           cache-dependency-path: web-portal/package-lock.json
 
-      - name: npm ci
-        if: steps.changed.outputs.run == 'true'
+      - name: Install frontend dependencies
         working-directory: web-portal
         run: npm ci
 
-      - name: npm run build
-        if: steps.changed.outputs.run == 'true'
+      - name: Check frontend types
+        working-directory: web-portal
+        run: npm run check
+
+      - name: Frontend regression tests
+        working-directory: web-portal
+        run: npm test
+
+      - name: Build frontend
         working-directory: web-portal
         run: npm run build
 
+      - name: Install browser for integration tests
+        working-directory: web-portal
+        run: npx playwright install --with-deps chromium
+
+      - name: Browser integration tests
+        working-directory: web-portal
+        run: npm run test:browser
+
+      - name: Prepare embedded UI for Go
+        run: |
+          mkdir -p files/4-apps/home/rinkhals/apps/65-rinkhals-web/ui
+          cp -a web-portal/build/. files/4-apps/home/rinkhals/apps/65-rinkhals-web/ui/
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: files/4-apps/home/rinkhals/apps/65-rinkhals-web/go.mod
+          cache-dependency-path: files/4-apps/home/rinkhals/apps/65-rinkhals-web/go.sum
+
+      - name: Start isolated MQTT broker
+        run: |
+          docker run --detach --name rinkhals-mqtt-test \
+            --publish 127.0.0.1:18883:1883 \
+            --mount type=bind,source="$GITHUB_WORKSPACE/tests/integration/mosquitto.conf",target=/mosquitto/config/mosquitto.conf,readonly \
+            eclipse-mosquitto:2
+          python3 - <<'PY'
+          import socket, time
+          for attempt in range(40):
+              try:
+                  with socket.create_connection(('127.0.0.1', 18883), timeout=1):
+                      break
+              except OSError:
+                  time.sleep(0.25)
+          else:
+              raise SystemExit('Integration broker did not start')
+          PY
+
+      - name: Go race tests, MQTT integration and vet
+        working-directory: files/4-apps/home/rinkhals/apps/65-rinkhals-web
+        env:
+          RINKHALS_TEST_MQTT_BROKER: tcp://127.0.0.1:18883
+        run: |
+          go test -race ./...
+          go vet ./...
+
+      - name: Cross-compile static ARMv7 backend
+        working-directory: files/4-apps/home/rinkhals/apps/65-rinkhals-web
+        env:
+          CGO_ENABLED: '0'
+          GOOS: linux
+          GOARCH: arm
+          GOARM: '7'
+        run: |
+          go build -trimpath -ldflags="-s -w" -o "$RUNNER_TEMP/rinkhals-web-armv7" .
+          readelf -h "$RUNNER_TEMP/rinkhals-web-armv7" | grep -E 'Machine:.*ARM'
+          if readelf -l "$RUNNER_TEMP/rinkhals-web-armv7" | grep -q INTERP; then
+            echo "Backend must not depend on a dynamic loader"
+            exit 1
+          fi
+
+      - name: Stop integration broker
+        if: always()
+        run: docker rm -f rinkhals-mqtt-test || true
+
+      - name: Upload browser failure report
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: browser-failure-report
+          path: |
+            web-portal/output/playwright
+            web-portal/playwright-report
+            web-portal/test-results
+          if-no-files-found: ignore
+
   python-tests:
-    name: Python component tests
+    name: Python and shell regression tests
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -90,3 +129,11 @@ jobs:
 
       - name: Run tests
         run: python -m pytest tests/ -q
+
+      - name: Moonraker lifecycle on Linux BusyBox
+        run: |
+          docker run --rm --read-only --tmpfs /tmp:rw,nosuid,nodev \
+            --mount type=bind,source="$GITHUB_WORKSPACE",target=/workspace,readonly \
+            --workdir /workspace --env PYTHONDONTWRITEBYTECODE=1 \
+            python:3.11-alpine \
+            python -m unittest discover -s tests -p test_shell_moonraker.py -v

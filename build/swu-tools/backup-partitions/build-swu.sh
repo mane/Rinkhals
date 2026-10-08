@@ -20,6 +20,7 @@ WORK=$(mktemp -d)
 trap "rm -rf $WORK" EXIT
 
 cp $FILES_DIR/3-rinkhals/opt/rinkhals/tools/backup-partitions.sh "$WORK"/update.sh
+cp $FILES_DIR/3-rinkhals/opt/rinkhals/tools/update-lock.sh "$WORK"/update-lock.sh
 
 
 # Create the update.swu

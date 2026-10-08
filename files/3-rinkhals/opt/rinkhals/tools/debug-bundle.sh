@@ -1,7 +1,12 @@
 #!/bin/sh
 
+. "$(dirname "$(realpath "$0")")/update-lock.sh"
+acquire_update_lock || exit 1
+trap release_update_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-UPDATE_PATH="/useremain/update_swu"
+
 TMP_PATH="/tmp/rinkhals-debug"
 
 mkdir -p $TMP_PATH
@@ -87,7 +92,6 @@ cp debug-bundle.zip /tmp/debug-bundle.zip
 # Cleanup
 cd
 rm -rf $TMP_PATH
-rm -rf $UPDATE_PATH
 sync
 
 # Play ok jingle to notify completion

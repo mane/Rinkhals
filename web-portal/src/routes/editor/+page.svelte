@@ -39,7 +39,7 @@
     }
 
     async function saveFile() {
-        if (!isFileLoaded && !content) return;
+        if (!isFileLoaded || !filePath.trim()) return;
 
         saving = true;
         message = { text: '', isError: false };
@@ -111,7 +111,7 @@
 
             <button
                 onclick={saveFile}
-                disabled={saving || loading || !content}
+                disabled={saving || loading || !isFileLoaded || !filePath.trim()}
                 class="flex items-center px-4 py-2 bg-brand hover:bg-brand-hover text-white rounded-lg font-medium transition-colors disabled:opacity-50 gap-2 shadow-sm"
             >
                 {#if saving}

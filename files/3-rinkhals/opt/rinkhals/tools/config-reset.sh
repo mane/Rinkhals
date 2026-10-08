@@ -1,7 +1,12 @@
 #!/bin/sh
 
+. "$(dirname "$(realpath "$0")")/update-lock.sh"
+acquire_update_lock || exit 1
+trap release_update_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
-UPDATE_PATH="/useremain/update_swu"
+
 
 
 # Check if the printer has Rinkhals installed
@@ -56,7 +61,6 @@ rm /useremain/rinkhals/.disable-rinkhals
 
 # Cleanup
 cd
-rm -rf $UPDATE_PATH
 sync
 
 

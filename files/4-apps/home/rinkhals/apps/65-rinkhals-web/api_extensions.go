@@ -4,8 +4,10 @@ import (
 	"bufio"
 	"encoding/json"
 	"fmt"
+	"io"
 	"io/ioutil"
 	"net/http"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -76,13 +78,12 @@ func cpuBusyPercent(window time.Duration) (int, bool) {
 	return int(busy + 0.5), true
 }
 
-
 func handleMetrics(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "application/json")
 
 	uptimeBytes, _ := ioutil.ReadFile("/proc/uptime")
 	uptimeStr := strings.Split(string(uptimeBytes), " ")[0]
-	
+
 	memBytes, _ := ioutil.ReadFile("/proc/meminfo")
 	var memTotal, memFree, memAvailable int
 	for _, line := range strings.Split(string(memBytes), "\n") {
@@ -135,16 +136,77 @@ func handleMetrics(w http.ResponseWriter, r *http.Request) {
 }
 
 func handleSaveFile(w http.ResponseWriter, r *http.Request) {
-
-	var req struct {
-		Path    string `json:"path"`
-		Content string `json:"content"`
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		return
 	}
-	json.NewDecoder(r.Body).Decode(&req)
+	var req struct {
+		Path    string  `json:"path"`
+		Content *string `json:"content"`
+	}
+	decoder := json.NewDecoder(r.Body)
+	if err := decoder.Decode(&req); err != nil || !filepath.IsAbs(req.Path) || req.Content == nil {
+		http.Error(w, "An absolute path and text content are required", http.StatusBadRequest)
+		return
+	}
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
+		http.Error(w, "Invalid request body", http.StatusBadRequest)
+		return
+	}
 
-	cleanPath := filepath.Clean(req.Path)
-	ioutil.WriteFile(cleanPath, []byte(req.Content), 0644)
+	if err := saveTextFile(req.Path, []byte(*req.Content)); err != nil {
+		http.Error(w, "Failed to save file: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+	writeJSONHeaders(w)
 	json.NewEncoder(w).Encode(map[string]interface{}{"success": true})
+}
+
+// Write beside the destination and rename only after the complete contents have
+// reached disk. Resolve existing symlinks so editing one preserves the link.
+func saveTextFile(path string, contents []byte) error {
+	path = filepath.Clean(path)
+	mode := os.FileMode(0644)
+	var owner *syscall.Stat_t
+	if info, err := os.Stat(path); err == nil {
+		if !info.Mode().IsRegular() {
+			return fmt.Errorf("destination is not a regular file")
+		}
+		mode = info.Mode().Perm()
+		owner, _ = info.Sys().(*syscall.Stat_t)
+		path, err = filepath.EvalSymlinks(path)
+		if err != nil {
+			return err
+		}
+	} else if !os.IsNotExist(err) {
+		return err
+	} else if info, linkErr := os.Lstat(path); linkErr == nil && info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("destination is a broken symlink")
+	}
+	f, err := os.CreateTemp(filepath.Dir(path), ".rinkhals-save-*")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(f.Name())
+	defer f.Close()
+	if owner != nil {
+		if err := f.Chown(int(owner.Uid), int(owner.Gid)); err != nil {
+			return err
+		}
+	}
+	if err := f.Chmod(mode); err != nil {
+		return err
+	}
+	if _, err := f.Write(contents); err != nil {
+		return err
+	}
+	if err := f.Sync(); err != nil {
+		return err
+	}
+	if err := f.Close(); err != nil {
+		return err
+	}
+	return os.Rename(f.Name(), path)
 }
 
 func handleServices(w http.ResponseWriter, r *http.Request) {
@@ -189,18 +251,26 @@ func handleServices(w http.ResponseWriter, r *http.Request) {
 
 func handleLogStream(w http.ResponseWriter, r *http.Request) {
 	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer conn.Close()
 
 	logPath := r.URL.Query().Get("path")
-	if logPath == "" { return }
+	if logPath == "" {
+		return
+	}
 	logPath = filepath.Clean(logPath)
 
 	cmd := exec.Command("tail", "-f", "-n", "100", logPath)
 	stdout, err := cmd.StdoutPipe()
-	if err != nil { return }
-	
-	if err := cmd.Start(); err != nil { return }
+	if err != nil {
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		return
+	}
 	defer cmd.Process.Kill()
 
 	go func() {

@@ -16,7 +16,7 @@ export interface PrinterStateResponse {
 	reason?: string;
 }
 
-const apiHost = import.meta.env.DEV ? "http://localhost:8090" : "";
+const apiHost = "";
 
 const initialState: PrinterStateResponse = {
 	state: "unknown",

@@ -97,12 +97,12 @@ type installRunState struct {
 }
 
 var (
-	firmwareInstallMu       sync.Mutex
-	installCurrent  *installRunState
-	installLog      []string        // ring buffer of log lines, capped
-	installLogMax   = 500
-	installWaiters  []chan struct{} // SSE subscribers; signalled on each update
-	preflightTokens = map[string]*preflightToken{}
+	firmwareInstallMu sync.Mutex
+	installCurrent    *installRunState
+	installLog        []string // ring buffer of log lines, capped
+	installLogMax     = 500
+	installWaiters    []chan struct{} // SSE subscribers; signalled on each update
+	preflightTokens   = map[string]*preflightToken{}
 )
 
 type preflightToken struct {
@@ -120,10 +120,10 @@ type preflightToken struct {
 // firmware version - if not, Rinkhals will refuse to load on next boot and the
 // user will be on stock until they install a compatible Rinkhals release.
 type compatibilityReport struct {
-	Compatible              bool     `json:"compatible"`
-	Warnings                []string `json:"warnings"`
-	RinkhalsPatchesForTarget bool    `json:"rinkhals_patches_for_target"`
-	TargetVersion           string   `json:"target_version,omitempty"`
+	Compatible               bool     `json:"compatible"`
+	Warnings                 []string `json:"warnings"`
+	RinkhalsPatchesForTarget bool     `json:"rinkhals_patches_for_target"`
+	TargetVersion            string   `json:"target_version,omitempty"`
 }
 
 // --- helpers ---
@@ -131,19 +131,26 @@ type compatibilityReport struct {
 func appendInstallLog(line string) {
 	stamp := time.Now().Format("15:04:05")
 	entry := stamp + " " + line
-	installLog = append(installLog, entry)
-	if len(installLog) > installLogMax {
-		installLog = installLog[len(installLog)-installLogMax:]
-	}
+	recordInstallLog(entry)
 	// Mirror to the on-disk install.log so the touch-panel UI and any SSH
 	// debugging see the same trace.
 	if f, err := os.OpenFile(installLogPath, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644); err == nil {
 		fmt.Fprintln(f, time.Now().Format(time.RFC3339), line)
 		f.Close()
 	}
-	notifyWaiters()
 }
 
+func recordInstallLog(entry string) {
+	firmwareInstallMu.Lock()
+	installLog = append(installLog, entry)
+	if len(installLog) > installLogMax {
+		installLog = installLog[len(installLog)-installLogMax:]
+	}
+	notifyWaiters()
+	firmwareInstallMu.Unlock()
+}
+
+// Caller holds firmwareInstallMu.
 func setInstallState(mutate func(*installRunState)) {
 	if installCurrent == nil {
 		return
@@ -153,6 +160,7 @@ func setInstallState(mutate func(*installRunState)) {
 	notifyWaiters()
 }
 
+// Caller holds firmwareInstallMu.
 func notifyWaiters() {
 	for _, ch := range installWaiters {
 		select {
@@ -190,7 +198,7 @@ func validateAssetURL(source, assetURL string) error {
 	case "anycubic":
 		// Anycubic publishes via cdn.cloud-universe.anycubic.com. We don't
 		// pin the path because the CDN paths look like opaque blob IDs.
-		if !strings.HasSuffix(host, "cloud-universe.anycubic.com") {
+		if host != "cloud-universe.anycubic.com" && !strings.HasSuffix(host, ".cloud-universe.anycubic.com") {
 			return fmt.Errorf("anycubic asset_url must come from cdn.cloud-universe.anycubic.com")
 		}
 	default:
@@ -201,11 +209,10 @@ func validateAssetURL(source, assetURL string) error {
 
 // --- compatibility check ---
 
-// checkAnycubicCompatibility verifies that the currently-installed Rinkhals
-// has patches for the target Anycubic firmware version. Rinkhals ships patches
-// as files under opt/rinkhals/patches/ named like K3SysUi.KS1_2.7.2.1.* and
-// gkapi.KS1_2.7.2.1.*. If the corresponding files don't exist, Rinkhals's
-// start.sh will refuse to apply the loader and the printer will boot stock.
+// checkAnycubicCompatibility consults the currently-installed Rinkhals boot
+// whitelist for the exact model and target Anycubic firmware version. Historical
+// patch files may remain in the bundle even after support has been withdrawn;
+// their presence alone does not mean start.sh will allow Rinkhals to load.
 func checkAnycubicCompatibility(targetVersion string) *compatibilityReport {
 	report := &compatibilityReport{
 		TargetVersion: targetVersion,
@@ -217,30 +224,46 @@ func checkAnycubicCompatibility(targetVersion string) *compatibilityReport {
 		report.Warnings = append(report.Warnings, "Could not determine current model or target version")
 		return report
 	}
-	patchesDir := "/useremain/rinkhals/.current/opt/rinkhals/patches"
-	entries, err := os.ReadDir(patchesDir)
+	supported, err := isSupportedFirmware(model, targetVersion)
 	if err != nil {
-		// No Rinkhals installed at all - installing a stock Anycubic firmware
-		// is fine in that case (there's nothing to be broken).
-		report.RinkhalsPatchesForTarget = true
+		report.Compatible = false
+		report.Warnings = append(report.Warnings, "Could not verify firmware support: "+err.Error())
 		return report
 	}
-	needle := fmt.Sprintf("%s_%s", model, targetVersion)
-	for _, e := range entries {
-		if strings.Contains(e.Name(), needle) {
-			report.RinkhalsPatchesForTarget = true
-			return report
-		}
+	if supported {
+		report.RinkhalsPatchesForTarget = true
+		return report
 	}
 	report.RinkhalsPatchesForTarget = false
 	report.Compatible = false
 	report.Warnings = append(report.Warnings, fmt.Sprintf(
-		"The currently-installed Rinkhals does not include patches for %s firmware %s. "+
+		"The currently-installed Rinkhals does not support %s firmware %s. "+
 			"After this install completes, Rinkhals will not start on next boot - the printer "+
-			"will run stock Anycubic firmware until you install a Rinkhals release that ships "+
-			"patches for %s. Make sure you have a compatible Rinkhals release ready to install afterward.",
+			"will run stock Anycubic firmware until you install a Rinkhals release that supports "+
+			"firmware %s. Make sure you have a compatible Rinkhals release ready to install afterward.",
 		model, targetVersion, targetVersion))
 	return report
+}
+
+// Ask the same whitelist used at boot; retained historical patch files alone
+// do not imply that this Rinkhals release supports their firmware.
+func isSupportedFirmware(model, version string) (bool, error) {
+	return querySupportedFirmware(toolsSh, model, version)
+}
+
+func querySupportedFirmware(script, model, version string) (bool, error) {
+	out, err := exec.Command("sh", "-c", `. "$1" >/dev/null 2>&1 && is_supported_firmware "$2" "$3"`, "rinkhals-web", script, model, version).Output()
+	if err != nil {
+		return false, err
+	}
+	switch strings.TrimSpace(string(out)) {
+	case "1":
+		return true, nil
+	case "0":
+		return false, nil
+	default:
+		return false, fmt.Errorf("invalid firmware support response")
+	}
 }
 
 // --- HTTP: preflight ---
@@ -348,6 +371,21 @@ func handleInstallCommit(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Invalid request body", http.StatusBadRequest)
 		return
 	}
+	if state := fetchPrinterState(); !state.CanInstall {
+		http.Error(w, "Printer is busy: "+state.Reason, http.StatusConflict)
+		return
+	}
+	stage, err := acquireInstallStage()
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusConflict)
+		return
+	}
+	started := false
+	defer func() {
+		if !started {
+			stage.release()
+		}
+	}()
 
 	firmwareInstallMu.Lock()
 	if installCurrent != nil && installCurrent.State != installStateIdle &&
@@ -391,7 +429,8 @@ func handleInstallCommit(w http.ResponseWriter, r *http.Request) {
 	installLog = installLog[:0]
 	firmwareInstallMu.Unlock()
 
-	go runInstall(token, dryRun)
+	started = true
+	go runInstall(token, dryRun, stage)
 
 	json.NewEncoder(w).Encode(map[string]interface{}{
 		"started":    true,
@@ -411,17 +450,22 @@ func handleInstallState(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+	json.NewEncoder(w).Encode(installSnapshot())
+}
+
+func installSnapshot() map[string]interface{} {
 	firmwareInstallMu.Lock()
 	defer firmwareInstallMu.Unlock()
-	resp := map[string]interface{}{
+	payload := map[string]interface{}{
 		"state": installStateIdle,
-		"log":   installLog,
+		"log":   append([]string{}, installLog...),
 	}
 	if installCurrent != nil {
-		resp["state"] = installCurrent.State
-		resp["run"] = installCurrent
+		payload["state"] = installCurrent.State
+		run := *installCurrent
+		payload["run"] = run
 	}
-	json.NewEncoder(w).Encode(resp)
+	return payload
 }
 
 func handleInstallProgress(w http.ResponseWriter, r *http.Request) {
@@ -456,17 +500,7 @@ func handleInstallProgress(w http.ResponseWriter, r *http.Request) {
 	}()
 
 	send := func() {
-		firmwareInstallMu.Lock()
-		payload := map[string]interface{}{
-			"state": installStateIdle,
-			"log":   append([]string{}, installLog...),
-		}
-		if installCurrent != nil {
-			payload["state"] = installCurrent.State
-			payload["run"] = installCurrent
-		}
-		firmwareInstallMu.Unlock()
-		buf, _ := json.Marshal(payload)
+		buf, _ := json.Marshal(installSnapshot())
 		fmt.Fprintf(w, "data: %s\n\n", buf)
 		flusher.Flush()
 	}
@@ -492,7 +526,8 @@ func handleInstallProgress(w http.ResponseWriter, r *http.Request) {
 
 // --- install runner ---
 
-func runInstall(token *preflightToken, dryRun bool) {
+func runInstall(token *preflightToken, dryRun bool, stage *installStageLock) {
+	defer stage.release()
 	defer func() {
 		if rec := recover(); rec != nil {
 			appendInstallLog(fmt.Sprintf("PANIC: %v", rec))
@@ -561,7 +596,7 @@ func runInstall(token *preflightToken, dryRun bool) {
 	})
 	firmwareInstallMu.Unlock()
 
-	if err := runUpdateScript(); err != nil {
+	if err := runUpdateScript(token.Source, stage.environment()); err != nil {
 		failInstall("update.sh failed", err)
 		return
 	}
@@ -765,15 +800,30 @@ func patchUpdateScript() error {
 	return nil
 }
 
-func runUpdateScript() error {
+func runUpdateScript(source string, env []string) error {
+	// Download/extraction can take minutes, during which a new print may start.
+	if state := fetchPrinterState(); !state.CanInstall {
+		return fmt.Errorf("printer is busy: %s", state.Reason)
+	}
 	scriptPath := filepath.Join(installExtractPath, "update.sh")
+	return executeUpdateScript(scriptPath, source, env, installLogWriter{})
+}
+
+func executeUpdateScript(scriptPath, source string, env []string, output io.Writer) error {
 	if err := os.Chmod(scriptPath, 0755); err != nil {
 		return err
 	}
-	cmd := exec.Command("sh", scriptPath)
-	cmd.Dir = installExtractPath
-	cmd.Stdout = installLogWriter{}
-	cmd.Stderr = installLogWriter{}
+	args := []string{scriptPath}
+	if source == "rinkhals" {
+		// Rinkhals's wrapper otherwise backgrounds the real installer and exits
+		// zero, hiding its failures from us.
+		args = append(args, "async")
+	}
+	cmd := exec.Command("sh", args...)
+	cmd.Dir = filepath.Dir(scriptPath)
+	cmd.Env = env
+	cmd.Stdout = output
+	cmd.Stderr = output
 	return cmd.Run()
 }
 

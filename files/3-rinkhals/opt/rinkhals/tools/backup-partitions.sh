@@ -1,5 +1,11 @@
 #!/bin/sh
 
+. "$(dirname "$(realpath "$0")")/update-lock.sh"
+acquire_update_lock || exit 1
+trap release_update_lock EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
 
 USB_DRIVE="/mnt/udisk"
 if [ ! -e $USB_DRIVE ]; then
@@ -27,7 +33,6 @@ tar -cvf $USB_DRIVE/useremain.tar \
     .
 
 # Cleanup
-rm -rf /useremain/update_swu
 sync
 
 # Play ok jingle to notify completion

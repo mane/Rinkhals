@@ -28,7 +28,7 @@
 		compatible_for_run: boolean;
 	}
 
-	const apiHost = import.meta.env.DEV ? "http://localhost:8090" : "";
+	const apiHost = "";
 
 	let data = $state<PatchesResponse | null>(null);
 	let loading = $state(true);

@@ -76,7 +76,7 @@
 		notice?: string;
 	};
 
-	const apiHost = import.meta.env.DEV ? "http://localhost:8090" : "";
+	const apiHost = "";
 
 	let tab = $state<"installed" | "catalog">("installed");
 
@@ -117,7 +117,9 @@
 	let busyApps = $state<Set<string>>(new Set());
 	let uninstallTarget = $state<App | null>(null);
 	let uninstallRunning = $state(false);
-	let configureApp = $state<App | null>(null);
+	let configureAppId = $state<string | null>(null);
+	const configureApp = $derived(apps.find((app) => app.id === configureAppId) ?? null);
+	let enablingApp = $state(false);
 
 	// Per-card description expansion. We only show the "Show more" affordance
 	// when the description is actually overflowing its clamp, measured at
@@ -272,20 +274,20 @@
 	// configure drawer to complete the "configure then enable" flow for apps that
 	// were installed but left disabled because they needed configuration.
 	async function saveAndEnable(app: App) {
-		if (hasPendingChanges()) {
-			await saveConfig();
-		}
+		if (enablingApp || configSaving) return;
+		enablingApp = true;
 		try {
+			if (hasPendingChanges() && !(await saveConfig())) return;
 			await callApp(app.id, "/enable", { method: "POST" });
 			await callApp(app.id, "/action", {
 				method: "POST",
 				body: JSON.stringify({ action: "start" })
 			});
 			showToast(`${app.name} enabled and started`);
-			const refreshed = apps.find((a) => a.id === app.id);
-			if (refreshed) configureApp = refreshed;
 		} catch {
 			// callApp already surfaced an error toast
+		} finally {
+			enablingApp = false;
 		}
 	}
 
@@ -361,7 +363,7 @@
 			}
 			showToast(`${app.name} uninstalled`);
 			// If the drawer is open on this app, close it: the app is gone.
-			if (configureApp?.id === app.id) configureApp = null;
+			if (configureAppId === app.id) closeConfigure();
 			// Refresh both lists. The catalog's "Installed" pill should flip back to "Install".
 			await Promise.all([fetchApps(), fetchCatalog(true)]);
 		} catch (e: any) {
@@ -383,12 +385,12 @@
 	}
 
 	function openConfigure(app: App) {
-		configureApp = app;
+		configureAppId = app.id;
 		pendingConfig = {};
 	}
 
 	function closeConfigure() {
-		configureApp = null;
+		configureAppId = null;
 		pendingConfig = {};
 	}
 
@@ -400,14 +402,17 @@
 		return Object.keys(pendingConfig).length > 0;
 	}
 
-	async function saveConfig() {
-		if (!configureApp || !hasPendingChanges()) return;
+	async function saveConfig(): Promise<boolean> {
+		if (!configureApp || configSaving) return false;
+		if (!hasPendingChanges()) return true;
+		const appId = configureApp.id;
+		const submitted = { ...pendingConfig };
 		configSaving = true;
 		try {
-			const res = await fetch(`${apiHost}/api/apps/${configureApp.id}/config`, {
+			const res = await fetch(`${apiHost}/api/apps/${appId}/config`, {
 				method: "PUT",
 				headers: { "Content-Type": "application/json" },
-				body: JSON.stringify(pendingConfig)
+				body: JSON.stringify(submitted)
 			});
 			const data = await res.json().catch(() => ({}));
 			if (!res.ok || data.success === false) {
@@ -415,11 +420,17 @@
 			}
 			showToast("Configuration saved");
 			await fetchApps();
-			const refreshed = apps.find((a) => a.id === configureApp!.id);
-			if (refreshed) configureApp = refreshed;
-			pendingConfig = {};
+			if (configureAppId === appId) {
+				const remaining = { ...pendingConfig };
+				for (const [key, value] of Object.entries(submitted)) {
+					if (remaining[key] === value) delete remaining[key];
+				}
+				pendingConfig = remaining;
+			}
+			return true;
 		} catch (e: any) {
 			showToast(e.message || "Save failed", "err");
+			return false;
 		} finally {
 			configSaving = false;
 		}
@@ -437,8 +448,6 @@
 			delete fresh[prop.key];
 			pendingConfig = fresh;
 			await fetchApps();
-			const refreshed = apps.find((a) => a.id === configureApp!.id);
-			if (refreshed) configureApp = refreshed;
 		} catch (e: any) {
 			showToast(e.message || "Reset failed", "err");
 		}
@@ -454,8 +463,6 @@
 			showToast("All overrides cleared");
 			pendingConfig = {};
 			await fetchApps();
-			const refreshed = apps.find((a) => a.id === configureApp!.id);
-			if (refreshed) configureApp = refreshed;
 		} catch (e: any) {
 			showToast(e.message || "Clear failed", "err");
 		}
@@ -1158,7 +1165,7 @@
 					<button
 						type="button"
 						onclick={saveConfig}
-						disabled={!hasPendingChanges() || configSaving}
+						disabled={!hasPendingChanges() || configSaving || enablingApp}
 						class="px-3 py-1.5 rounded-lg text-sm font-medium disabled:opacity-40 flex items-center gap-1.5 {app.enabled ? 'bg-brand hover:bg-brand-hover text-white' : 'bg-surface hover:bg-surface-warm border border-line-soft text-ink'}"
 					>
 						{#if configSaving}
@@ -1170,7 +1177,7 @@
 						<button
 							type="button"
 							onclick={() => saveAndEnable(app)}
-							disabled={configSaving}
+							disabled={configSaving || enablingApp}
 							class="px-3 py-1.5 rounded-lg text-sm font-medium bg-brand hover:bg-brand-hover text-white disabled:opacity-40 flex items-center gap-1.5"
 						>
 							<Play size={13} />
